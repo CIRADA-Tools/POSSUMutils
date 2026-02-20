@@ -1,27 +1,17 @@
 # POSSUMutils
 A set of control tools related to running the POSSUM 1D and 3D pipelines on the CANFAR science platform. 
 
-With everything set up (credentials, pip install -r requirements.txt) on the virtual machine, start running the 1D pipeline as follows:
+Please see the documentation "Possum Pipeline Documentation" at https://askap.org/possum/Data/POSSUMPipelineControlDocs
 
-```
-screen -r 1Dpipeline # or screen -S 1Dpipeline the first time
-cd POSSUMutils/
-bash go_1Dpipeline.sh
-```
+With everything set up (credentials, etc) on CANFAR and the AUSSRC Prefect server, start running the 3D / 1D pipeline from deployments at
 
-or the 3D pipeline:
+https://possum-prefect.aussrc.org/deployments
 
-```
-screen -r 3Dpipeline # or screen -S 3Dpipeline the first time
-cd POSSUMutils/
-bash go_3Dpipeline
-```
+High-level overview of the 1D pipeline (updated on 2026-02-20)
+<img width="4402" height="1886" alt="POSSUM_1d_PartialTiles_v2 light" src="https://github.com/user-attachments/assets/43e676ab-3c5a-4d91-a2a1-0dedca39285f" />
 
-High-level overview of the 1D pipeline (updated on 2025-12-11)
-<img width="4402" height="1942" alt="POSSUM_1d_PartialTiles light" src="https://github.com/user-attachments/assets/10c95097-d37e-4a9c-9309-a40f994d1c21" />
-
-High-level overview of the 3D pipeline (updated on 2025-12-11)
-<img width="4102" height="1754" alt="POSSUM_3d_pipeline_control light" src="https://github.com/user-attachments/assets/2f14253a-5ee4-4e79-86f5-a38ae33cfce3" />
+High-level overview of the 3D pipeline (updated on 2026-02-20)
+<img width="4112" height="2048" alt="POSSUM_3d_pipeline_control_v2 light" src="https://github.com/user-attachments/assets/c15b30fc-22ba-4374-a940-bbd688ce3bae" />
 
 
 
@@ -32,7 +22,7 @@ A set of scripts meant to live on CANFAR where they can be called to start headl
 
 ## possum_pipeline_control/
 
-A set of scripts meant to live on the virtual machine 'p1' to operate the control logic for launching POSSUM pipelines on CANFAR.
+A set of scripts meant to live on the AUSSRC Prefect VM to operate the control logic for launching POSSUM pipelines on CANFAR. Particularly the control*.py files. 
 
 
 ## root directory (./)
