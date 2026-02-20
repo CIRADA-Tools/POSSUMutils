@@ -280,11 +280,14 @@ def launch_download_session(jobname="3dtile-dl"):
         replicas=1,
     )
 
+    session_id_str = session_id_str = session_id[0] if len(session_id) > 0 else None
+
     print("Check sessions at https://ws-uv.canfar.net/skaha/v1/session")
     print(
-        f"Check logs at https://ws-uv.canfar.net/skaha/v1/session/{session_id[0]}?view=logs"
+        f"Check logs at https://ws-uv.canfar.net/skaha/v1/session/{session_id_str}?view=logs"
     )
-    return session_id[0]
+
+    return session_id_str
 
 def launch_create_symlinks(jobname="3dsymlinks"):
     """
@@ -317,11 +320,14 @@ def launch_create_symlinks(jobname="3dsymlinks"):
         replicas=1,
     )
 
+    session_id_str = session_id_str = session_id[0] if len(session_id) > 0 else None
+
     print("Check sessions at https://ws-uv.canfar.net/skaha/v1/session")
     print(
-        f"Check logs at https://ws-uv.canfar.net/skaha/v1/session/{session_id[0]}?view=logs"
+        f"Check logs at https://ws-uv.canfar.net/skaha/v1/session/{session_id_str}?view=logs"
     )
-    return session_id[0]
+
+    return session_id_str
 
 def needs_prefect_db_backup(
     home_dir: str | Path,

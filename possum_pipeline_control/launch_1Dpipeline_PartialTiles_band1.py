@@ -42,12 +42,14 @@ def launch_session(run_name, field_ID, tilenumbers, SBnumber, image, cores, ram)
         replicas=1,
     )
 
+    session_id_str = session_id_str = session_id[0] if len(session_id) > 0 else None
+
     print("Check sessions at https://ws-uv.canfar.net/skaha/v1/session")
     print(
-        f"Check logs at https://ws-uv.canfar.net/skaha/v1/session/{session_id[0]}?view=logs"
+        f"Check logs at https://ws-uv.canfar.net/skaha/v1/session/{session_id_str}?view=logs"
     )
 
-    return session_id[0]
+    return session_id_str
 
 
 @flow(name="launch_1d_partialtiles", log_prints=True)

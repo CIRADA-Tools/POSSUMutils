@@ -33,21 +33,24 @@ Rules:
       this will depend on the type of CANFAR job that we were running though.
   
 """
-
-
 from __future__ import annotations
+import os
+import pprint
 
+from canfar.sessions import Session
 from dataclasses import dataclass
 
-from prefect import task
+from prefect import task, flow
 from prefect.client.orchestration import get_client
 from prefect.server.schemas.filters import FlowRunFilter, FlowRunFilterState
 from prefect.server.schemas.states import StateType
 from prefect.states import Failed
 
 from print_all_open_sessions import get_open_sessions
+from vos import Client
 
 TAG_PREFIX = "canfar_session:"
+VOS_LOG_FOLDER = "arc:projects/CIRADA/polarimetry/ASKAP/Pipeline_logs/canfar_logs"
 
 
 @dataclass(frozen=True)
@@ -205,4 +208,86 @@ async def reconcile_running_prefect_with_canfar_task(limit: int = 200) -> dict:
         "failed_marked": result.failed_marked,
         "skipped_untagged": result.skipped_untagged,
     }
+
+@flow(name="Get completed sessions logs and push to Canfar directory")
+def get_completed_session_logs():
+    """
+    Get recently completed CANFAR sessions and push their logs to Canfar directory.
+    This includes Succeeded, Completed, Failed or Error sessions. 
+    The directory is /arc/projects/CIRADA/polarimetry/ASKAP/Pipeline_logs/canfar_logs.
+    """
+    session = Session()
+    statuses = ["Succeeded", "Completed", "Failed", "Error"]
+    # Get all session ids of completed sessions
+    all_session_ids = [
+        s["id"]
+        for status in statuses
+        for s in (session.fetch(kind="headless", status=status) or [])
+    ]
+    for session_id in all_session_ids:
+        # Get logs for each session
+        get_logs(session, session_id)
+
+def push_logs_to_canfar(tmp_file):
+    """
+    Copy Canfar session logs to Canfar directory and remove local file
+    Args:
+        tmp_file: Local log file to copy and delete
+    """
+    client = Client()
+    
+    # Ensure remote directory exists
+    try:
+        client.mkdir(VOS_LOG_FOLDER)
+    except:
+        pass  # Directory might already exist
+    
+    try:
+        remote_file = f"{VOS_LOG_FOLDER}/{tmp_file}"
+        client.copy(tmp_file, remote_file)
+        print(f"Upload Canfar log to {remote_file} completed successfully!\n")
+    except Exception as e:
+        print(f"Failed to upload {tmp_file} to Canfar: {e}\n")
+        return
+    
+    # Clean up local file
+    os.remove(tmp_file)    
+
+def log_exists_in_canfar_dir(session_id):
+    """
+    Check if log already exists in Canfar directory.
+    Args:
+        session_id: ID of the session
+    Returns:
+        True if log exists, False otherwise
+    """
+    client = Client()
+    file_name = f"{VOS_LOG_FOLDER}/{session_id}.log"
+    try:
+        return client.isfile(file_name)
+    except:
+        # Folder doesn't exist yet
+        return False
+        
+
+def get_logs(session, session_id):
+    """
+    Get logs for a Canfar session.
+
+    Args:
+        session: Canfar session object
+        session_id: ID of the session to monitor
+        output_file: File to write logs to
+    """
+    if log_exists_in_canfar_dir(session_id):
+        return
+    
+    tmp_file = f"{session_id}.log"
+    
+    with open(tmp_file, "w") as f:
+        # Fetch logs before exiting
+        logs_dict = session.logs(session_id).get(session_id)
+        f.write(pprint.pformat(logs_dict, depth=4))
+        f.flush
+    push_logs_to_canfar(tmp_file)       
 

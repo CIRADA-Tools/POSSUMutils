@@ -25,6 +25,7 @@ from datetime import datetime
 from pathlib import Path
 
 import astropy.table as at
+from canfar.sessions import Session
 import gspread
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
@@ -35,6 +36,7 @@ from dotenv import load_dotenv
 
 from automation import database_queries as db
 from possum_pipeline_control import util
+
 
 
 def get_sheet_table(band):
@@ -461,9 +463,6 @@ def launch_collate_job():
     """
     Launches the collate job for the 1D pipeline. Once per day
     """
-    # from skaha.session import Session
-    from canfar.sessions import Session
-
     session = Session()
 
 
@@ -495,11 +494,14 @@ def launch_collate_job():
         replicas=1,
     )
 
+    session_id_str = session_id_str = session_id[0] if len(session_id) > 0 else None
+
     print("Check sessions at https://ws-uv.canfar.net/skaha/v1/session")
     print(
-        f"Check logs at https://ws-uv.canfar.net/skaha/v1/session/{session_id[0]}?view=logs"
+        f"Check logs at https://ws-uv.canfar.net/skaha/v1/session/{session_id_str}?view=logs"
     )
-    return session_id[0]
+
+    return session_id_str
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Update Partial Tile Google Sheet")
