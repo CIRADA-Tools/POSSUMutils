@@ -23,7 +23,7 @@ description: "Deploy prefect flows with the latest POSSUM code from git."
 pull:
   - prefect.deployments.steps.git_clone:
       id: clone-step
-      repository: https://github.com/ErikOsinga/POSSUMutils.git
+      repository: https://github.com/CIRADA-Tools/POSSUMutils.git
       branch: main
   - prefect.deployments.steps.pip_install_requirements:
       requirements_file: requirements.txt
