@@ -209,7 +209,7 @@ async def reconcile_running_prefect_with_canfar_task(limit: int = 200) -> dict:
         "skipped_untagged": result.skipped_untagged,
     }
 
-@flow(name="Get completed sessions logs and push to Canfar directory")
+@flow(name="Get completed sessions logs and push to Canfar directory", log_prints=True)
 def get_completed_session_logs():
     """
     Get recently completed CANFAR sessions and push their logs to Canfar directory.
