@@ -68,7 +68,14 @@ def launch_test_session(jobname="testjob"):
     )
     print("Also check the prefect dashboard at localhost:4200 or possum-prefect.aussrc.org")
 
-    return session_id[0]
+    session_id_str = session_id[0] if len(session_id) > 0 else None
+
+    if session_id_str is not None:
+        print(f"Session launched successfully with ID: {session_id_str}")
+    else:
+        raise ValueError("Failed to launch session. No session ID returned. CANFAR is down?")
+
+    return session_id_str
 
 
 if __name__ == "__main__":

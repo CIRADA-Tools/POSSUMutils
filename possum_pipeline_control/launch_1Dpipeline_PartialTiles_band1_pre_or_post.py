@@ -86,6 +86,11 @@ def launch_session(
         f"Check logs at https://ws-uv.canfar.net/skaha/v1/session/{session_id_str}?view=logs"
     )
 
+    if session_id_str is not None:
+        print(f"Session launched successfully with ID: {session_id_str}")
+    else:
+        raise ValueError("Failed to launch session. No session ID returned. CANFAR is down?")
+
     return session_id_str
 
 if __name__ == "__main__":
