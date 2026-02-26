@@ -67,9 +67,17 @@ def replace_working_directory_and_save(file_path, tile_workdir):
     with open(new_file_path, "w") as new_file:
         for line in lines:
             if line.startswith("working_directory:"):
+                # make sure to change the working directory to the tile workdir
                 new_file.write(f"working_directory: {tile_workdir}\n")
+            elif line.startswith("proxy_file_name:"):
+                # make sure the proxy file name points to the correct location of the CADC certificate
+                new_file.write(
+                    f"proxy_file_name: {os.path.expanduser('~/.ssl/cadcproxy.pem')}\n"
+                )
             else:
+                # blanket copy all other lines
                 new_file.write(line)
+
 
     return new_file_path
 

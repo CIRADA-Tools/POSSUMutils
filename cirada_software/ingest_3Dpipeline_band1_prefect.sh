@@ -12,4 +12,4 @@ export PYTHONPATH="/arc/projects/CIRADA/polarimetry/software/RMtoolsdev/:$PYTHON
 # move to POSSUMutils base directory
 cd /arc/projects/CIRADA/polarimetry/software/POSSUMutils/
 # arguments: tile_number, band ("943MHz" or "1367MHz")
-python -m possum_pipeline_control.ingest3Dpipeline $1 $2
+python -m possum_pipeline_control.ingest3Dpipeline $1 $2 -CADC_cert_file $HOME/.ssl/cadcproxy.pem
