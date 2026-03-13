@@ -567,9 +567,11 @@ def get_fields_ready_single_SB_pipeline(band_number, conn) -> Table:
     returns a table with columns ["name", "sbid"]
     """
     sql = f"""
-    SELECT name, sbid FROM possum.observation_state_band{band_number}
-    WHERE ("single_sb_1d_pipeline" IS NULL or "single_sb_1d_pipeline" = '')
-    AND UPPER("cube_state") = 'COMPLETED';
+    SELECT s.name, o.sbid FROM possum.observation_state_band{band_number} s, possum.observation o
+    WHERE s.name = o.name
+    AND
+    (s."single_sb_1d_pipeline" IS NULL or s."single_sb_1d_pipeline" = '')
+    AND UPPER(s."cube_state") = 'COMPLETED';
     """
     rows, colnames = execute_query(sql, conn, return_colnames=True)
     return rows_to_table(rows, colnames=colnames)
