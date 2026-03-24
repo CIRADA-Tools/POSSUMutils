@@ -83,7 +83,11 @@ def build_running_canfar_session_set(session_df) -> set[str]:
     if "status" not in session_df.columns or "id" not in session_df.columns:
         return set()
 
-    running = session_df[session_df["status"].astype(str).str.lower() == "running"]
+    running = session_df[
+    session_df["status"].astype(str).str.lower().isin(
+        ["pending", "running", "terminating", "succeeded"]
+    )
+]
     return {str(x).strip() for x in running["id"].dropna().tolist() if str(x).strip()}
 
 
