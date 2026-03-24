@@ -493,7 +493,8 @@ def run_prefect_db_backup():
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H%M%SZ")
     OUTDIR = Path.home() / "prefect-backups"
     OUTDIR.mkdir(parents=True, exist_ok=True)
-    db_backup = OUTDIR / f"prefect-{ts}.sql"
+    db_file_name = f"prefect-{ts}.sql"
+    db_backup = OUTDIR / db_file_name
     
     cmd = ["bash", bkpscript, str(db_backup)]
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -513,9 +514,14 @@ def run_prefect_db_backup():
         )
     # --- Copy to CANFAR ---
     print("Copying the backup to CANFAR...")
-    client = Client()
-    client.copy(str(db_backup), "arc:projects/CIRADA/polarimetry/software/prefect-backups")
-    print("Backup completed successfully")    
+    try:
+        client = Client()
+        VOS_FOLDER = "arc:projects/CIRADA/polarimetry/software/prefect-backups"
+        remote_file = f"{VOS_FOLDER}/{db_file_name}"
+        client.copy(str(db_backup), remote_file)
+        print("Backup completed successfully")    
+    except Exception as e:
+        print(f"Failed to copy backup to CANFAR: {e}")  
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
