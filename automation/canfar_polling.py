@@ -85,7 +85,7 @@ def build_running_canfar_session_set(session_df) -> set[str]:
 
     running = session_df[
     session_df["status"].astype(str).str.lower().isin(
-        ["pending", "running", "terminating", "succeeded"]
+        ["pending", "running", "terminating", "succeeded", "completed"]
     )
 ]
     return {str(x).strip() for x in running["id"].dropna().tolist() if str(x).strip()}
