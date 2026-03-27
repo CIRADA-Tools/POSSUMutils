@@ -7,7 +7,7 @@ on:
         description: 'Docker image tag name'
         required: false
         type: string
-        default: 'v1.18.0'
+        default: 'v2.0.2'
       python_version:
         description: 'The python version used for the image'
         required: false
