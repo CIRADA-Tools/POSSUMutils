@@ -83,7 +83,11 @@ def build_running_canfar_session_set(session_df) -> set[str]:
     if "status" not in session_df.columns or "id" not in session_df.columns:
         return set()
 
-    running = session_df[session_df["status"].astype(str).str.lower() == "running"]
+    running = session_df[
+    session_df["status"].astype(str).str.lower().isin(
+        ["pending", "running", "terminating", "succeeded", "completed"]
+    )
+]
     return {str(x).strip() for x in running["id"].dropna().tolist() if str(x).strip()}
 
 
@@ -107,6 +111,7 @@ async def _fetch_prefect_completed_flow_runs(limit: int = 200):
 async def _fail_flow_run(flow_run_id, reason: str) -> None:
     """Mark the specified flow-run as FAILED with the given reason/message."""
     async with get_client() as client:
+        await client.cancel_flow_run(flow_run_id=flow_run_id)
         await client.set_flow_run_state(
             flow_run_id=flow_run_id,
             state=Failed(message=reason),
