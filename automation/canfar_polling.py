@@ -111,7 +111,6 @@ async def _fetch_prefect_completed_flow_runs(limit: int = 200):
 async def _fail_flow_run(flow_run_id, reason: str) -> None:
     """Mark the specified flow-run as FAILED with the given reason/message."""
     async with get_client() as client:
-        await client.cancel_flow_run(flow_run_id=flow_run_id)
         await client.set_flow_run_state(
             flow_run_id=flow_run_id,
             state=Failed(message=reason),
