@@ -316,14 +316,23 @@ def do_ingest(
     # if this fails with SSLError, try to run cadc-get-cert -u <username> on CANFAR
     CADCsuccess, date = check_CADC(tilenumber, band, CADC_cert_file)
 
+    # CADC is the source of truth for ingest success: if all expected products are
+    # in CADC, the tile is ingested regardless of what `_report.txt` says about this
+    # particular run. _report.txt only records per-file outcomes of the current attempt,
+    # so transient minoc timeouts on files that were already uploaded by a prior partial
+    # run produce false-negative IngestFailed status (seen on tiles 11720, 11532, 11846).
     status = "IngestFailed"
-    if success:
-        if CADCsuccess:
-            status = "Ingested"
-        else:
-            print("_report.txt reports succesful ingest, but CADC ingest failed")
+    if CADCsuccess:
+        status = "Ingested"
+        if not success:
+            print(
+                "_report.txt reports per-file errors but CADC contains all expected "
+                "products; treating as Ingested."
+            )
+    elif success:
+        print("_report.txt reports successful ingest but CADC is missing products.")
     else:
-        print("_report.txt reports that ingestion failed")
+        print("_report.txt reports that ingestion failed and CADC is missing products.")
 
     # Record the status in the POSSUM Validation database
     conn = db.get_database_connection(test=False)
