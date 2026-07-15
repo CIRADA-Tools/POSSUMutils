@@ -13,3 +13,4 @@ astroquery
 matplotlib
 prefect==3.4.25
 tqdm
+astropy_healpix
