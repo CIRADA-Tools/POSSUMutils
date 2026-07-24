@@ -72,12 +72,12 @@ def test_update_3d_val_link():
 
 def test_update_3d_pipeline():
     conn = rest_api.PossumApiClient() # pass in config.env if using config.env instead of Prefect secrets
-    date = date.today().isoformat()
+    today = date.today().isoformat()
     response = conn.patch(f"/3d-pipeline/tiles/update/3d_pipeline/?band_number={band_number}",
                     json={
                           "band_number": 1,
                           "tile_number": tile_number,
-                          "timestamp": date
+                          "timestamp": today
                     }, #avoid encoding problem in url
     )
     print('Rows updated:', response.get("rows_updated"))    
@@ -107,3 +107,15 @@ def test_tiles_by_tile_id():
     if len(rows) > 0:
         ingest_value = rows[0]["3d_pipeline_ingest"]
         print('ingest value ', ingest_value)    
+
+if __name__ == "__main__":
+    test_update_1d_pipeline_validation()
+    test_update_single_sb_1d_pipeline()
+    test_update_partial_tiles()
+    test_update_3d_pipeline_val()
+    test_update_3d_val_link()
+    test_update_3d_pipeline()
+    test_tiles_ready_for_3d_pipeline()
+    test_tiles_ready_for_ingest()
+    test_3d_plotting()
+    test_tiles_by_tile_id()        
