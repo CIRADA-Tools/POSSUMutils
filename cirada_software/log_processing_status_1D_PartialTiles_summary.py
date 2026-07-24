@@ -10,7 +10,7 @@ import numpy as np
 from dotenv import load_dotenv
 from prefect import flow, task
 
-from automation import database_queries as db
+from automation import possum_api_client as rest_api
 from possum_pipeline_control import util
 
 """
@@ -56,15 +56,22 @@ def update_1d_database(field_ID, SBid, band, status, conn):
     band (str): The band of the tile.
     Google_API_token (str): The path to the Google API token JSON file.
     status (str): The status to set in the 'status_column' column.
+    conn : REST API session
 
     """
     print("Updating POSSUM pipeline validation database with summary plot status")
 
     band_number = util.get_band_number(band)
     full_field_name = util.get_full_field_name(field_ID, band)
-    rows_to_update = db.update_1d_pipeline_table(
-        full_field_name, band_number, status, "1d_pipeline_validation", conn
-    )
+
+
+    response = conn.patch("/1d-pipeline/observations/update/1d_pipeline_validation/?"
+                          f"band_number={band_number}&"
+                          f"field_name={full_field_name}&"
+                          f"status={status}")
+    rows_to_update = response.get("rows_updated")
+
+    
     if rows_to_update == 0:
         print(f"No rows found for field {full_field_name} and SBID {SBid}")
         return False
@@ -75,8 +82,8 @@ def update_1d_database(field_ID, SBid, band, status, conn):
     else:
         print("Failed to update the database.")
     # Check if there are boundary issues for this field and SBID
-    boundary_issue = db.find_boundary_issues(SBid, full_field_name, band_number, conn)
-
+    boundary_issue = conn.get(f"/1d-pipeline/partial-tiles/boundary-issues/band{band_number}/{full_field_name}/")[0]
+    
     return boundary_issue
 
 
@@ -128,16 +135,14 @@ def update_status_spreadsheet(
         col_letter = gspread.utils.rowcol_to_a1(
             1, column_names.index(status_column) + 1
         )[0]
-        conn = db.get_database_connection(
-            test=False, database_config_path=database_config_path
-        )
+        api = rest_api.PossumApiClient(database_config_path)
         for row_index in rows_to_update:
             sleep(2)  # 60 writes per minute only
             tile_sheet.update(range_name=f"{col_letter}{row_index}", values=[[status]])
-            db.update_1d_pipeline_table(
-                full_field_name, band_number, status, "single_sb_1d_pipeline", conn
-            )
-        conn.close()
+            api.patch(f"/1d-pipeline/observations/update/{status_column.lower()}/?"
+                      f"band_number={band_number}&"
+                      f"field_name={full_field_name}&"
+                      f"status={status}")
         print(
             f"Updated all {len(rows_to_update)} rows for field {full_field_name} and SBID {SBid} to status '{status}' in '{status_column}' column."
         )
@@ -206,6 +211,7 @@ def main(args):
 
     # Load constants for Google spreadsheets
     load_dotenv(dotenv_path=database_config_path)
+    log_file_path = None
 
     if len(log_files) > 1:
         log_file_path = log_files[-1]
@@ -233,11 +239,8 @@ def main(args):
     # Update the POSSUM Validation database table
     t1 = task(update_1d_database, name="update_1d_database")
     # execute tasks serially such that logging is preserved (instead of .submit)
-    conn = db.get_database_connection(
-        test=False, database_config_path=database_config_path
-    )
-    has_boundary_issue = t1(field_ID, SB_num, band, status, conn)
-    conn.close()
+    api_client = rest_api.PossumApiClient(database_config_path)
+    has_boundary_issue = t1(field_ID, SB_num, band, status, api_client)
 
     if status == "Completed":
         # Update the POSSUM Pipeline Status spreadsheet as well. A complete field has been processed!

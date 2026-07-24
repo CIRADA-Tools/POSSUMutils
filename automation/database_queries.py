@@ -1,5 +1,6 @@
 """
 Database query functions for interacting with the ausSRC database.
+DEPRECATED as of Jun 23 2026 - This has been replaced with api_client.py. We can no longer directly query the database.
 """
 
 import os

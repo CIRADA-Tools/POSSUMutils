@@ -31,7 +31,7 @@ except ImportError:
         "Could not import possum_run from possum2caom2.composable. Make sure possum2caom2 is installed."
     )
     possum_run = None
-from automation import database_queries as db
+from automation import possum_api_client as rest_api
 from possum_pipeline_control import util
 
 # 14 (grouped) products for the 3D pipeline
@@ -136,23 +136,26 @@ def update_tile_database(tile_number, band_str, status, test_flag, conn):
     """
     print("Updating POSSUM pipeline validation database")
     band_number = util.get_band_number(band_str)
-    row = db.get_3d_tile_data(tile_number, band_number, conn)
-    if len(row) > 0:
+    rows = conn.get_json(f"/3d-pipeline/tiles/tile-id/band{band_number}/{tile_number}/")
+    
+    if len(rows) > 0:
+        ingest_value = rows[0]["3d_pipeline_ingest"]
         if not test_flag:
             # Status should be "IngestRunning" otherwise something went wrong
-            if row[0][3] != "IngestRunning":
+            if ingest_value != "IngestRunning":
                 raise ValueError(
-                    f"Found status {row[0][3]} while it should be 'IngestRunning'"
+                    f"Found status {ingest_value} while it should be 'IngestRunning'"
                 )
         else:
             print(
-                f"Testing enabled. Current status of tile {tile_number} is {row[0][3]}"
+                f"Testing enabled. Current status of tile {tile_number} is {ingest_value}"
             )
 
         # Update the status in the '3d_pipeline_ingest' column
-        row_num = db.update_3d_pipeline_table(
-            tile_number, band_number, status, "3d_pipeline_ingest", conn
-        )
+        response = conn.patch(f"/3d-pipeline/tiles/update/3d_pipeline_ingest/?band_number={band_number}"
+                            f"&tile_number={tile_number}"
+                            f"&3d_pipeline_ingest={status}")
+        row_num = response.get('rows_updated')
         if row_num > 0:
             print(
                 f"Updated tile {tile_number} status to {status} in '3d_pipeline_ingest' column."
@@ -265,9 +268,14 @@ def update_status_spreadsheet(tile_number, band, Google_API_token, date):
         tile_sheet.update(range_name=f"{col_letter}{tile_index}", values=[[date]])
         print(f"Updated tile {tile_number} status to {date} in '3d_pipeline' column.")
         # Also update the DB
-        conn = db.get_database_connection(test=False)
-        db.update_3d_pipeline_table(tile_number, band_number, date, "3d_pipeline", conn)
-        conn.close()
+        conn = rest_api.PossumApiClient()
+        conn.patch(f"/3d-pipeline/tiles/update/3d_pipeline/",
+                    json={
+                        "band_number": band_number,
+                        "tile_number": tile_number,
+                        "timestamp": date
+                    }, #avoid encoding problem in url
+        )
     else:
         print(f"Tile {tile_number} not found in the sheet.")
 
@@ -335,9 +343,8 @@ def do_ingest(
         print("_report.txt reports that ingestion failed and CADC is missing products.")
 
     # Record the status in the POSSUM Validation database
-    conn = db.get_database_connection(test=False)
+    conn = rest_api.PossumApiClient()
     update_tile_database(tilenumber, band, status, test_flag=test, conn=conn)
-    conn.close()
 
     if status == "Ingested":
         # If succesful, also record the date of ingestion in POSSUM status spreadsheet

@@ -4,7 +4,7 @@ import os
 from canfar.sessions import Session
 from vos import Client
 
-from automation import database_queries as db
+from automation import possum_api_client as rest_api
 from possum_pipeline_control import util
 
 session = Session()
@@ -37,8 +37,7 @@ def get_tiles_for_ingest(band_number, conn):
     list: A list of tile numbers that satisfy the conditions.
     """
     # Find the tiles that satisfy the conditions
-    return db.get_tiles_for_ingest(band_number, conn)
-
+    return conn.get_json(f"/3d-pipeline/tiles/ready-for-ingest/band{band_number}/")
 
 def get_canfar_tiles(band_number):
     client = Client()
@@ -100,7 +99,7 @@ def launch_ingest(tilenumber, band):
 
     return session_id_str
 
-def update_status(tile_number, band, status, conn):
+def update_status(tile_number, band, status, api):
     """
     Update the status of the specified tile in the database.
 
@@ -110,9 +109,10 @@ def update_status(tile_number, band, status, conn):
     status (str): The status to set in the '3d_pipeline_ingest' column.
     """
     band_no = util.get_band_number(band)
-    return db.update_3d_pipeline_table(
-        tile_number, band_no, status, "3d_pipeline_ingest", conn
-    )
+    return api.patch(f"/3d-pipeline/tiles/update/3d_pipeline_ingest/?band_number={band_no}"
+                     f"&tile_number={tile_number}"
+                     f"&3d_pipeline_ingest={status}")
+    
 
 def ingest_3Dpipeline(band_number=1):
     if band_number == 1:
@@ -121,13 +121,10 @@ def ingest_3Dpipeline(band_number=1):
         band = "1367MHz"
 
     # Check database for band 1 tiles that have been processed AND validated
-    conn = db.get_database_connection(test=False)
+    conn = rest_api.PossumApiClient()
     tile_numbers = get_tiles_for_ingest(band_number, conn)
-    tile_numbers = [
-        str(tn) for tn in tile_numbers
-    ]  # make sure they are strings for comparison
-    conn.close()
-
+    tile_numbers = [str(row["tile"]) for row in tile_numbers] # make sure they are strings for comparison
+    
     canfar_tilenumbers = get_canfar_tiles(band_number=band_number)
 
     if len(tile_numbers) > 0:
@@ -160,9 +157,7 @@ def ingest_3Dpipeline(band_number=1):
             launch_ingest(tilenumber, band)
 
             # Update the status of 3d_pipeline_ingest to "IngestRunning"
-            conn = db.get_database_connection(test=False)
             row_count = update_status(tilenumber, band, "IngestRunning", conn)
-            conn.close()
             if row_count == 0:
                 print(f"Tile {tilenumber} not found in the sheet.")
 

@@ -16,13 +16,13 @@ import numpy as np
 from astropy import table as at
 
 # assume this script is run as a module from the POSSUMutils package
-from automation import database_queries as db
+from automation import possum_api_client
 
 GOOGLE_API_TOKEN = "/home/erik/.ssh/psm_gspread_token.json"
 VALIDATION_SHEET_URL = "https://docs.google.com/spreadsheets/d/1sWCtxSSzTwjYjhxr1_KVLWG2AnrHwSJf_RWQow7wbH0/"
 
 
-def build_update_query(
+def run_update_query(
     tiles: np.ndarray,
     timestamp: Optional[datetime.datetime] = None,
 ) -> str:
@@ -48,30 +48,28 @@ def build_update_query(
     if tiles.size == 0:
         raise ValueError("No tiles provided to update.")
 
-    # Ensure all entries are integers and build the IN list
-    tile_list_str = ", ".join(str(int(t)) for t in tiles)
+    api = possum_api_client.PossumApiClient()
 
-    if timestamp is None:
-        # Use DB server time
-        timestamp_expr = "NOW()"
-    else:
-        # Format as 'YYYY-MM-DD HH:MM:SS' and cast explicitly
-        ts_str = timestamp.replace(microsecond=0).isoformat(sep=" ")
-        timestamp_expr = f"'{ts_str}'::timestamp"
+    updated_rows = 0
+    for t in tiles:
+        response = api.patch(
+            "/3d-pipeline/tiles/update/3d_pipeline/",
+            json={
+             "band_number": 1,
+             "tile_number": t,
+             "timestamp": timestamp
+            }, #avoid encoding problem in url
+        )
+        
+        num_rows = response.get('rows_updated')
+        updated_rows += num_rows
 
-    query = f"""
-        UPDATE possum.tile_state_band1
-        SET "3d_pipeline" = {timestamp_expr}
-        WHERE tile IN ({tile_list_str});
-    """
-
-    return query.strip()
+    return updated_rows
 
 
 def update_3d_pipeline_for_tiles(
     tiles: np.ndarray,
     timestamp: Optional[datetime.datetime] = None,
-    test: bool = False,
 ) -> None:
     """
     Execute the UPDATE to set "3d_pipeline" for the given tiles.
@@ -82,22 +80,10 @@ def update_3d_pipeline_for_tiles(
         1D array of tile ids (integers).
     timestamp : datetime.datetime or None
         If None, uses NOW() in the database.
-    test : bool
-        Passed through to db.get_database_connection(test=...).
     """
-    query = build_update_query(tiles, timestamp=timestamp)
+    num_rows = run_update_query(tiles, timestamp=timestamp)
 
-    conn = db.get_database_connection(test=test)
-    try:
-        rows = db.execute_query(query, conn)
-        # If the connection is not in autocommit mode, commit explicitly:
-        if hasattr(conn, "commit"):
-            conn.commit()
-    finally:
-        if hasattr(conn, "close"):
-            conn.close()
-
-    print(f"Update executed successfully. Updated {len(rows)} rows")
+    print(f"Update executed successfully. Updated {num_rows} rows")
 
 
 def load_tile_validation_sheet(band: str = "943MHz") -> at.Table:
@@ -141,8 +127,8 @@ if __name__ == "__main__":
     print(f"Number of tiles to update: {len(processed_tiles)}")
 
     # Option A: use NOW() on the DB side
-    update_3d_pipeline_for_tiles(processed_tiles, timestamp=None, test=False)
+    update_3d_pipeline_for_tiles(processed_tiles, timestamp=None)
 
     # Option B: use an explicit timestamp
     # explicit_ts = datetime.datetime(2025, 1, 1, 12, 0, 0)
-    # update_3d_pipeline_for_tiles(example_tiles, timestamp=explicit_ts, test=False)
+    # update_3d_pipeline_for_tiles(example_tiles, timestamp=explicit_ts)

@@ -2,7 +2,7 @@ import argparse
 import ast
 import glob
 
-from automation import database_queries as db
+from automation import possum_api_client as rest_api
 from possum_pipeline_control import util
 
 """
@@ -50,9 +50,14 @@ def update_partial_tile_1d_pipeline(field_ID, tile_numbers, band, status, conn):
     """
     fieldname = util.get_full_field_name(field_ID, band)
     band_number = util.get_band_number(band)
-    db.update_partial_tile_1d_pipeline_status(
-        fieldname, tile_numbers, band_number, status, conn
-    )
+    conn.patch("/1d-pipeline/partial-tiles/update/status/",
+                            json={
+                            "band_number": band_number,
+                            "field_name": fieldname,
+                            "tile_numbers": tile_numbers,
+                            "status": status,
+                            },
+            )
     ## TODO: validation in case all tiles have been completed
 
     # # Find the validation file path
@@ -154,8 +159,6 @@ if __name__ == "__main__":
     print(f"Tilenumbers {tilestr} status: {status}, band: {band}")
 
     # Update the POSSUM partial_tile_1d_pipeline database table
-    conn = db.get_database_connection(
-        test=False, database_config_path=database_config_path
-    )
+    conn = rest_api.PossumApiClient(database_config_path)
     update_partial_tile_1d_pipeline(field_ID, tilenumbers, band, status, conn)
-    conn.close()
+    

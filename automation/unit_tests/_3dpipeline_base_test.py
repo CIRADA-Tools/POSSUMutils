@@ -1,4 +1,6 @@
 """
+DEPRECATED since July 13, 2026: Direct database access has been replaced by REST API. The tests are now covered in possum_pipeline_control/test_rest_api.py
+
 Base class for setting up 3D Pipeline test cases. This is to reduce repetitions across test cases
 because the setup is all the same.
 """

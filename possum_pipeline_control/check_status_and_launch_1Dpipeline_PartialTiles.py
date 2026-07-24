@@ -6,7 +6,7 @@ import time
 
 from vos import Client
 
-from automation import database_queries as db
+from automation import possum_api_client as rest_api
 from possum_pipeline_control import util
 from possum_pipeline_control.control_1D_pipeline_PartialTiles import get_open_sessions
 
@@ -59,7 +59,7 @@ def get_results_per_field_sbid_skip_edges(band_number, conn, verbose=False):
         dict: A dictionary with keys as (field_name, sbid) tuples and boolean values indicating whether
               the conditions are met for the non-edge rows.
     """
-    rows = db.get_observations_non_edge_rows(band_number, conn)
+    rows = conn.get(f"/1d-pipeline/observations/non-edge-rows/band{band_number}/")
     results = {}
 
     # Group the table by 'field_name' and 'sbid'
@@ -83,7 +83,7 @@ def get_results_per_field_sbid(conn, band_number="1", verbose=False):
     If all Partial tiles for a fieldname have been completed boolean=True, otherwise false.
     """
     # Group the table by 'field_name' and 'sbid'
-    results = db.get_observations_with_complete_partial_tiles(band_number, conn)
+    results = conn.get(f"/1d-pipeline/partial-tiles/complete-partial-tiles/band{band_number}/")
     field_sbid_dict = {}
     # make dict to get rid of duplicates
     for row in results:
@@ -124,7 +124,7 @@ def get_tiles_for_pipeline_run(db_conn, band_number):
     """
     # Find the tiles that satisfy the conditions
     # (i.e. has an SBID and not yet a '1d_pipeline' status)
-    rows = db.get_partial_tiles_for_1d_pipeline_run(band_number, db_conn)
+    rows = db_conn.get(f"/1d-pipeline/partial-tiles/ready-for-pipeline/band{band_number}/")
     fields_to_run, SBids_to_run = [], []
     tile1_to_run, tile2_to_run, tile3_to_run, tile4_to_run = [], [], [], []
     if rows:
@@ -345,13 +345,12 @@ def update_validation_status(
         status (str): The status to set in the specified column.
     """
     print("Updating partial tile status in the POSSUM pipeline validation sheet.")
-    conn = db.get_database_connection(
-        test=False, database_config_path=database_config_path
-    )
-    row_num = db.update_1d_pipeline_table(
-        field_name, band_number, "Running", "1d_pipeline_validation", conn
-    )
-    conn.close()
+    conn = rest_api.PossumApiClient(database_config_path)
+    response = conn.patch("/1d-pipeline/observations/update/1d-pipeline-validation/?"
+                            f"band_number={band_number}&"
+                            f"field_name={field_name}&"
+                            "status=Running")
+    row_num = response.get("rows_updated")
 
     if row_num > 0:
         print(
@@ -396,9 +395,7 @@ def launch_band1_1Dpipeline(database_config_path=None):
     # i.e.  'SBID' column is not empty, 'number_sources' is not empty, and '1d_pipeline' column is empty
 
     # connect to the database
-    conn = db.get_database_connection(
-        test=False, database_config_path=database_config_path
-    )
+    conn = rest_api.PossumApiClient(database_config_path)
     (
         field_IDs,
         tile1,
@@ -412,8 +409,6 @@ def launch_band1_1Dpipeline(database_config_path=None):
     assert len(tile1) == len(tile2) == len(tile3) == len(tile4), (
         "Need to have 4 tile columns in google sheet. Even if row can be empty."
     )
-    # close the connection
-    conn.close()
     # list of full sourcelist filenames
     canfar_sourcelists = get_canfar_sourcelists(band_number=1)
     # canfar_sourcelists = ['selavy-image.i.EMU_0314-46.SB59159.cont.taylor.0.restored.conv.components.15sig.xml',
@@ -548,14 +543,15 @@ def launch_band1_1Dpipeline(database_config_path=None):
                     launch_pipeline(field_ID_no_prefix, tilenumbers, SBid, band)
 
                     # Update the status to "Running"
-                    conn = db.get_database_connection(
-                        test=False, database_config_path=database_config_path
-                    )
-                    db.update_partial_tile_1d_pipeline_status(
-                        field_ID, tilenumbers, band_number, "Running", conn
-                    )
-                    conn.close()
-
+                    conn = rest_api.PossumApiClient(database_config_path)
+                    conn.patch("/1d-pipeline/partial-tiles/update/status/",
+                           json={
+                            "band_number": band_number,
+                            "field_name": field_ID,
+                            "tile_numbers": tilenumbers,
+                            "status": "Running",
+                            },
+                        )
                     break
 
         else:

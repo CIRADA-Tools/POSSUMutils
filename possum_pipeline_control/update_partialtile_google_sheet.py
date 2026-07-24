@@ -34,7 +34,7 @@ import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
 
-from automation import database_queries as db
+from automation import possum_api_client as rest_api
 from possum_pipeline_control import util
 
 
@@ -98,13 +98,14 @@ def get_ready_fields(band: str) -> tuple[at.Table, at.Table]:
     else:
         raise ValueError("Band must be either '943MHz' or '1367MHz'")
     
-    conn = db.get_database_connection(test=False)
-    ready_table = db.get_fields_ready_single_SB_pipeline(band_number, conn)
-    conn.close()
-    # get rid of the ASKAP- prefix in sbid for easier matching with google sheet
-    sbids = [row["sbid"].strip("ASKAP-") for row in ready_table]
-    ready_table["sbid"] = sbids
-
+    conn = rest_api.PossumApiClient()
+    ready_table = pd.DataFrame(
+        conn.get_json(
+            f"/1d-pipeline/observations/single-sb-1d-pipeline/fields-ready/band{band_number}/"
+        )
+    )
+    # Get rid of the ASKAP- prefix in sbid for easier matching with Google Sheet
+    ready_table["sbid"] = ready_table["sbid"].str.removeprefix("ASKAP-")
     ready_table_sheet, full_table_sheet = get_sheet_table(band)
 
     if len(ready_table_sheet) != len(ready_table):
@@ -123,7 +124,8 @@ def get_ready_fields(band: str) -> tuple[at.Table, at.Table]:
                 print(f"     - {fn}")
 
     ## getting full table from the database works also, but its a different table structure than Camerons sheet.
-    # full_table: at.Table = db.get_full_table_single_SB_pipeline(band_number, conn, as_table=True)
+    # full_table: at.Table = pd.DataFrame(
+    #                             conn.get_json(f"/1d-pipeline/observations/single-sb-1d-pipeline/full-table/band{band_number}/"))
 
     return ready_table, full_table_sheet
 

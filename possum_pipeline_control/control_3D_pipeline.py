@@ -9,7 +9,7 @@ import numpy as np
 from dotenv import load_dotenv
 from prefect import flow
 
-from automation import database_queries as db
+from automation import possum_api_client as rest_api, database_queries as db
 from possum_pipeline_control import util
 from print_all_open_sessions import get_open_sessions
 
@@ -18,8 +18,8 @@ def create_3d_progress_plot():
     """Create a progress plot for the 3D pipeline."""
 
     load_dotenv(dotenv_path="./automation/config.env")
-    conn = db.get_database_connection(test=False)
-    rows = db.get_3d_tile_data(tile_id=None, band_number=1, conn=conn)
+    conn = rest_api.PossumApiClient()
+    rows = conn.get("/3d-pipeline/tiles/plotting/band1/")
     # tile, "3d_pipeline_val", "3d_val_link", "3d_pipeline_ingest", "3d_pipeline", "cube_state"
     tile3d_table = db.rows_to_table(
         rows,

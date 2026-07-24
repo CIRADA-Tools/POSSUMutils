@@ -1,4 +1,6 @@
 """
+DEPRECATED since July 13, 2026: Direct database access has been replaced by REST API. The tests are now covered in possum_pipeline_control/test_rest_api.py
+
 Test cirada_software: log_processing_status_1D_PartialTiles_summary.py
 """
 

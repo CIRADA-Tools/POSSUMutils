@@ -19,18 +19,16 @@ PREFECT_API_URL : API URL for the Prefect server to bypass the OAuth Proxy (Gith
 2. Prefect secrets (under Blocks):
 ----------------------------------
 cadc-proxy-pem | Generate cadcproxy.pem with CANFAR interactive session, and copy the content here. 
-database-host | POSSUM database IP address
-database-name | POSSUM database name
-database-password |  POSSUM database password
-database-port |  POSSUM database port
-database-user |  POSSUM database username
+possum-api-url | POSSUM REST API URL
+possum-api-username | POSSUM portal username with update privileges
+possum-api-password | POSSUM portal password
 possum-status-sheet |  link to POSSUM status Google spreadsheet
 possum-status-token |  Copy the content of the json token to access the possum-status-sheet above
 
 You can still use your own config.env as below to override the production secrets for testing purposes.
 1. Rename config.env.example to config.env.
-2. Enter ausSRC database details in the .env file. 
-3. Enter Google spreadsheet token
-4. Update Google spreadsheet file locations (only if the files are different, e.g. for testing)
+2. Enter Google spreadsheet token
+3. Update Google spreadsheet file locations (only if the files are different, e.g. for testing)
+4. Enter POSSUM REST API URL, username and password for using a test REST API instance.
 
 

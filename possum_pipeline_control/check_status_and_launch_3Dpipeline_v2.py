@@ -36,7 +36,7 @@ from canfar.sessions import Session
 from vos import Client
 
 from automation import canfar_polling
-from automation import database_queries as db
+from automation import possum_api_client as rest_api
 from possum_pipeline_control import util
 from print_all_open_sessions import get_open_sessions
 
@@ -173,11 +173,9 @@ def update_status(tile_number, band, Google_API_token, status):
             f"Updated tile {tile_number} status to {status} in '3d_pipeline' column in Google Sheet."
         )
         # Also update the DB
-        conn = db.get_database_connection(test=False)
-        db.update_3d_pipeline_table(
-            tile_number, band_number, status, "3d_pipeline_val", conn
-        )
-        conn.close()
+        conn = rest_api.PossumApiClient()
+        conn.patch(f"/3d-pipeline/tiles/update/3d_pipeline_val/?band_number={band_number}"
+                   f"&tile_number={tile_number}&3d_pipeline_val={status}")
     else:
         print(f"Tile {tile_number} not found in the sheet.")
 
@@ -428,13 +426,12 @@ async def launch_band1_3Dpipeline(database_config_path=None):
 
     # Check database for band 1 tiles that have been processed by AUSSRC
     # but not yet processed with 3D pipeline
-    conn = db.get_database_connection(test=False, database_config_path=database_config_path)
+    conn = rest_api.PossumApiClient(database_config_path)
     # We are getting the tiles from the DB instead of the sheet now
-    tile_numbers = db.get_tiles_for_pipeline_run(conn, band_number=1)
+    tile_numbers = conn.get("/3d-pipeline/tiles/ready-for-3d/band1/")
     # tile_numbers is a list of single-element tuples, convert to 1D list
     tile_numbers = [str(tup[0]) for tup in tile_numbers]
 
-    conn.close()
 
     # Also check whether the tiles have been downloaded to CANFAR
     canfar_tilenumbers = get_canfar_tiles(band_number=1)

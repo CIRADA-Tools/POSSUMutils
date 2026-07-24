@@ -13,7 +13,7 @@ import numpy as np
 import tqdm
 
 # assume this script is run as a module from the POSSUMutils package
-from automation import database_queries as db  # noqa: E402
+from automation import possum_api_client # noqa: E402
 
 GOOGLE_API_TOKEN = "/home/erik/.ssh/neural-networks--1524580309831-c5c723e2468e.json"
 VALIDATION_SHEET_URL = (
@@ -109,25 +109,14 @@ def get_partial_tiles_database(band_number: int = 1) -> list[tuple]:
     Returns:
         list[tuple]: Each tuple is a row from the database with p.* and o.sbid as last field.
     """
-    conn = db.get_database_connection(test=False)
-    try:
-        print(
-            f"Fetching full partial tiles data table for 1D pipeline run for band {band_number} "
-            "from the database."
-        )
-        query = f"""
-            SELECT p.*, o.sbid
-            FROM possum.partial_tile_1d_pipeline_band{band_number} AS p
-            LEFT JOIN possum.observation AS o ON p.observation = o.name
-        """
-        rows = db.execute_query(query, conn)
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            # If the connection object is not closable, ignore.
-            pass
-
+    conn = possum_api_client.PossumApiClient()
+    
+    print(
+        f"Fetching full partial tiles data table for 1D pipeline run for band {band_number} "
+        "from the database."
+    )
+    rows = conn.get(f"/partial_tiles/sbid/band{band_number}/")
+    
     return rows
 
 
@@ -288,23 +277,13 @@ def get_observation_state_validation(band_number: int = 1) -> dict[str, str]:
     Returns:
         dict mapping field_name -> normalised 1d_pipeline_validation state.
     """
-    conn = db.get_database_connection(test=False)
-    try:
-        query = f"""
-            SELECT name, "1d_pipeline_validation"
-            FROM possum.observation_state_band{band_number}
-        """
-        rows = db.execute_query(query, conn)
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
-
-    state_by_field: dict[str, str] = {}
-    for field_name, validation_state in rows:
-        state_by_field[str(field_name)] = normalize_value(validation_state)
-
+    conn = possum_api_client.PossumApiClient()
+    rows = conn.get_json(f"/1d-pipeline/observations/single-sb-1d-pipeline/full-table/band{band_number}/")
+    
+    state_by_field = {}
+    for row in rows:
+        state_by_field[row["name"]] = normalize_value(row["1d_pipeline_validation"])
+ 
     return state_by_field
 
 

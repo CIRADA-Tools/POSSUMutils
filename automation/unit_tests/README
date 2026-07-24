@@ -1,3 +1,6 @@
+!!DEPRECATED since July 13, 2026!!
+!!Direct database access has been replaced by REST API. The tests are now covered in possum_pipeline_control/test_rest_api.py!!
+
 The tests use the database connection details used in test.env file. Please create the test.env file with the following keys:
 
 TEST_DATABASE_HOST=

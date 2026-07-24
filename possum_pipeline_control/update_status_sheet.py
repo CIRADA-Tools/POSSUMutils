@@ -6,7 +6,7 @@ import gspread
 import numpy as np
 from dotenv import load_dotenv
 
-from automation import database_queries as db
+from automation import possum_api_client as rest_api
 from possum_pipeline_control import util
 
 """
@@ -67,11 +67,10 @@ def update_status(tile_number, band, Google_API_token, status):
         tile_sheet.update(range_name=f"{col_letter}{tile_index}", values=[[status]])
         print(f"Updated tile {tile_number} status to {status} in '3d_pipeline' column.")
         # Also update the DB
-        conn = db.get_database_connection(test=False)
-        db.update_3d_pipeline_table(
-            tile_number, band_number, status, "3d_pipeline_val", conn
-        )
-        conn.close()
+        conn = rest_api.PossumApiClient()
+        conn.patch(f"/3d-pipeline/tiles/update/3d_pipeline_val/?band_number={band_number}"
+                   f"&tile_number={tile_number}"
+                   f"&3d_pipeline_val={status}")
     else:
         print(f"Tile {tile_number} not found in the sheet.")
 

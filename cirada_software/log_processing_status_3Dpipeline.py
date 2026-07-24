@@ -9,7 +9,7 @@ import numpy as np
 from dotenv import load_dotenv
 from prefect import flow, task
 
-from automation import database_queries as db
+from automation import possum_api_client as rest_api
 from possum_pipeline_control import util
 
 """
@@ -157,14 +157,14 @@ def update_3d_tile_database(tile_number, band, status):
         validation_link = "HTMLFileNotFound"
 
     # execute query
-    conn = db.get_database_connection(test=False)
-    rows_updated = db.update_3d_pipeline_table(
-        tile_number, band_number, status, "3d_pipeline_val", conn
-    )
-    db.update_3d_pipeline_table(
-        tile_number, band_number, validation_link, "3d_val_link", conn
-    )
-    conn.close()
+    conn = rest_api.PossumApiClient()
+    response = conn.patch(f"/3d-pipeline/tiles/update/3d_pipeline_val/?band_number={band_number}"
+                          f"&tile_number={tile_number}"
+                          f"&3d_pipeline_val={status}")
+    rows_updated = response.get('rows_updated')
+    conn.patch(f"/3d-pipeline/tiles/update/3d_val_link/?band_number={band_number}"
+               f"&tile_number={tile_number}"
+               f"&3d_val_link={validation_link}")
 
     # Print results
     if rows_updated <= 0:
