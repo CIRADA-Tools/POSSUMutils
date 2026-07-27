@@ -99,13 +99,11 @@ def get_ready_fields(band: str) -> tuple[at.Table, at.Table]:
         raise ValueError("Band must be either '943MHz' or '1367MHz'")
     
     conn = rest_api.PossumApiClient()
-    ready_table = pd.DataFrame(
-        conn.get_json(
-            f"/1d-pipeline/observations/single-sb-1d-pipeline/fields-ready/band{band_number}/"
-        )
-    )
-    # Get rid of the ASKAP- prefix in sbid for easier matching with Google Sheet
-    ready_table["sbid"] = ready_table["sbid"].str.removeprefix("ASKAP-")
+    response = conn.get_json(f"/1d-pipeline/observations/single-sb-1d-pipeline/fields-ready/band{band_number}/")
+    ready_table = at.Table(rows=response)
+    # get rid of the ASKAP- prefix in sbid for easier matching with google sheet
+    sbids = [row["sbid"].strip("ASKAP-") for row in ready_table]
+    ready_table["sbid"] = sbids
     ready_table_sheet, full_table_sheet = get_sheet_table(band)
 
     if len(ready_table_sheet) != len(ready_table):
