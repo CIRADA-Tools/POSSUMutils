@@ -123,7 +123,7 @@ def ingest_3Dpipeline(band_number=1):
     # Check database for band 1 tiles that have been processed AND validated
     conn = rest_api.PossumApiClient()
     tile_numbers = get_tiles_for_ingest(band_number, conn)
-    tile_numbers = [str(row["tile"]) for row in tile_numbers] # make sure they are strings for comparison
+    tile_numbers = [str(tn) for tn in tile_numbers]  # endpoint returns plain ints, not dicts
     
     canfar_tilenumbers = get_canfar_tiles(band_number=band_number)
 
