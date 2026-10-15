@@ -6,6 +6,7 @@ from vos import Client
 
 from automation import possum_api_client as rest_api
 from possum_pipeline_control import util
+from possum_pipeline_control.reconcile_ingest import reconcile_stuck_ingest_running
 
 session = Session()
 
@@ -122,6 +123,15 @@ def ingest_3Dpipeline(band_number=1):
 
     # Check database for band 1 tiles that have been processed AND validated
     conn = rest_api.PossumApiClient()
+
+    # Reconcile any tiles stuck at IngestRunning (session died before writing
+    # status back, e.g. CANFAR outage). Flips to Ingested if CADC has all 14
+    # planes; nulls if no live `ingest<N>` session exists so pipeline retries.
+    try:
+        reconcile_stuck_ingest_running(band_number, conn)
+    except Exception as e:  # noqa: BLE001 - never fail the whole flow on reconcile
+        print(f"[reconcile_ingest] skipped due to error: {e!r}")
+
     tile_numbers = get_tiles_for_ingest(band_number, conn)
     tile_numbers = [str(tn) for tn in tile_numbers]  # endpoint returns plain ints, not dicts
     
