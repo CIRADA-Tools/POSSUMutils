@@ -44,8 +44,13 @@ EXPECTED_3D_PLANES = {
 # Skaha session states that mean a session is still active (reconcile skips these).
 _ALIVE_SKAHA_STATES = {"pending", "running"}
 
-# Default CADC cert for TAP; same path check_CADC uses on CANFAR.
-_DEFAULT_CERT = "/arc/home/ErikOsinga/.ssl/cadcproxy.pem"
+# Default CADC cert for TAP. Prefect's "Stage CADC certificate" task
+# (util.stage_cadc_certificate) deposits the cert at ~/.ssl/cadcproxy.pem of
+# the Prefect worker user before the flow runs. The absolute path hardcoded
+# in ingest3Dpipeline.check_CADC ("/arc/home/ErikOsinga/.ssl/cadcproxy.pem")
+# only works when running headless on CANFAR as that user, which the
+# reconciler does NOT.
+_DEFAULT_CERT = os.path.expanduser("~/.ssl/cadcproxy.pem")
 
 
 def _get_stuck_tiles(conn, band_number):
