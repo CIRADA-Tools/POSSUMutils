@@ -272,7 +272,7 @@ def remove_observation(
 def check_and_remove_from_CADC(
     tilenumber: str | None,
     band: None | str = "943MHz",
-    cadc_cert_file: str = "/arc/home/ErikOsinga/.ssl/cadcproxy.pem",
+    cadc_cert_file: str | None = None,
     cutoff_date: str = "2025-01-01",
     dry_run: bool = True,
     plot_path: str = "CADC_ingestion_counts_per_day.png",
@@ -290,6 +290,8 @@ def check_and_remove_from_CADC(
 
     Returns a pandas DataFrame of artifacts selected for deletion (or dry-run deletion).
     """
+    if cadc_cert_file is None:
+        cadc_cert_file = os.path.expanduser("~/.ssl/cadcproxy.pem")
     session = _make_cadc_session(cadc_cert_file)
 
     # ---- Query 1: Artifact URIs for data records / files (for cadcremove) ----
@@ -464,7 +466,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--cert",
         dest="cert",
-        default="/arc/home/ErikOsinga/.ssl/cadcproxy.pem",
+        default=os.path.expanduser("~/.ssl/cadcproxy.pem"),
         help="Path to CADC proxy certificate PEM.",
     )
     parser.add_argument(

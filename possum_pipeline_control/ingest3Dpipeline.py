@@ -166,8 +166,10 @@ def update_tile_database(tile_number, band_str, status, test_flag, conn):
 
 @task
 def check_CADC(
-    tilenumber, band, CADC_cert_file="/arc/home/ErikOsinga/.ssl/cadcproxy.pem"
+    tilenumber, band, CADC_cert_file=None
 ):
+    if CADC_cert_file is None:
+        CADC_cert_file = os.path.expanduser("~/.ssl/cadcproxy.pem")
     """
     query CADC for 3D pipeline products
 
@@ -285,13 +287,15 @@ def do_ingest(
     tilenumber,
     band,
     test=False,
-    CADC_cert_file="/arc/home/ErikOsinga/.ssl/cadcproxy.pem",
+    CADC_cert_file=None,
 ):
     """Does the ingest script
 
     1. Create config.yml based on template
     2. Execute "possum_run" in the correct directory
     """
+    if CADC_cert_file is None:
+        CADC_cert_file = os.path.expanduser("~/.ssl/cadcproxy.pem")
 
     config_template = "/arc/projects/CIRADA/polarimetry/ASKAP/Pipeline_logs/config_templates/config_ingest.yml"
     tile_workdir = (
@@ -370,7 +374,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "-CADC_cert_file",
         type=str,
-        default="/arc/home/ErikOsinga/.ssl/cadcproxy.pem",
+        default=os.path.expanduser("~/.ssl/cadcproxy.pem"),
         help="Path to CADC certificate file",
     )
 
