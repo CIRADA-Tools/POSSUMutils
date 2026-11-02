@@ -15,12 +15,21 @@ one or more files) is caught and treated as incomplete rather than flipped:
                                                         -> PATCH NULL (retry)
   CADC incomplete AND session alive                     -> no-op (still in flight)
 
+A second pass runs every tick, purely for observability: `ingest<N>` skaha
+sessions whose status is still 'Running'/'Pending' past the staleness
+threshold (default 2.5 h; a real do_ingest completes in ~20-30 min) are
+reported in a WARNING log line with an inline curl delete command, and
+surfaced in a Prefect Markdown artifact `stale-skaha-sessions`. Deletion is
+left to the operator — this PR adds the signal, not the action.
+
 Call reconcile_stuck_ingest_running(band_number, conn) at the start of
 check_ingest_3Dpipeline.ingest_3Dpipeline() BEFORE get_tiles_for_ingest.
 """
 from __future__ import annotations
 
 import os
+import re
+from datetime import datetime, timezone
 
 import astroquery.cadc as cadc
 import requests
@@ -54,6 +63,22 @@ _MINOC_PREFIX = "https://ws-cadc.canfar.net/minoc/files/"
 
 # Timeout for a single minoc HEAD. Each tile makes up to 14 of these.
 _MINOC_HEAD_TIMEOUT_S = 15
+
+# Threshold for marking an `ingest<N>` skaha session as stale (observability
+# only in this version — we log + emit a Prefect artifact; we do NOT delete).
+# A real do_ingest end-to-end is ~20-30 minutes; the 10 skaha ghosts we hit on
+# 2026-11-02 were 23-32h. 2.5h is ~5x typical and leaves large margin for slow
+# but legitimate runs. Operator still deletes manually.
+_STALE_INGEST_SESSION_HOURS = 2.5
+
+# Only `ingest<N>` sessions are considered (3D-pipeline ingest sessions).
+# 1D sessions use a different name convention (<sbid>-HH-MM-SS) and can run
+# legitimately for many hours, so we never touch them here.
+_INGEST_SESSION_RE = re.compile(r"^ingest\d+$")
+
+# Skaha session delete endpoint for the inline copy-paste command we emit in
+# the WARNING log line and in the Prefect Markdown artifact.
+_SKAHA_SESSION_URL = "https://ws-uv.canfar.net/skaha/v1/session"
 
 # Default CADC cert for TAP. Prefect's "Stage CADC certificate" task
 # (util.stage_cadc_certificate) deposits the cert at ~/.ssl/cadcproxy.pem of
@@ -187,6 +212,131 @@ def _live_ingest_session_tiles():
     return tiles
 
 
+def _parse_skaha_start_time(s):
+    """Parse a skaha `startTime` string into a timezone-aware datetime.
+
+    skaha returns ISO-8601 with a trailing 'Z' (e.g. '2026-11-02T02:22:16Z').
+    datetime.fromisoformat accepts 'Z' from Python 3.11; we normalise anyway
+    so this works on 3.10 and earlier Prefect base images.
+    Returns None on parse failure or a 'Pending' placeholder.
+    """
+    if not isinstance(s, str) or s == "Pending":
+        return None
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _find_stale_ingest_sessions(threshold_hours=_STALE_INGEST_SESSION_HOURS):
+    """Return a list of `ingest<N>` sessions that have been Running past the
+    staleness threshold.
+
+    A real 3D ingest completes in ~20-30 minutes. Sessions running past
+    `threshold_hours` are overwhelmingly skaha-side ghosts (the Python
+    process has died but skaha's state didn't flip to Completed). They
+    throttle the 3D flow by making it look like too many sessions are in
+    flight, so new ingests from the null queue never get submitted.
+
+    This function only observes — it does NOT delete anything. The caller
+    logs each stale session with an inline curl delete command, and emits
+    a Prefect Markdown artifact so the operator can act from the flow run
+    page. Deciding to auto-delete later is a separate PR.
+    """
+    try:
+        df = get_open_sessions()
+    except Exception as e:  # noqa: BLE001 - skaha fetch may fail; be defensive
+        print(f"[reconcile_ingest] skaha session fetch for staleness check "
+              f"failed: {e!r}; no stale list this tick")
+        return []
+    if df is None or len(df) == 0:
+        return []
+    if not {"name", "status", "startTime", "id"}.issubset(df.columns):
+        return []
+
+    now = datetime.now(tz=timezone.utc)
+    stale = []
+    for _, row in df.iterrows():
+        name = str(row["name"])
+        status = str(row["status"])
+        if not _INGEST_SESSION_RE.match(name):
+            continue
+        if status.lower() not in _ALIVE_SKAHA_STATES:
+            continue
+        start = _parse_skaha_start_time(row.get("startTime"))
+        if start is None:
+            continue
+        age_hours = (now - start).total_seconds() / 3600.0
+        if age_hours < threshold_hours:
+            continue
+        stale.append({
+            "name": name,
+            "id": str(row["id"]),
+            "status": status,
+            "startTime": str(row["startTime"]),
+            "age_hours": age_hours,
+        })
+    return stale
+
+
+def _report_stale_sessions(stale):
+    """Log a WARNING per stale session and emit a Prefect Markdown artifact.
+
+    Writes nothing when `stale` is empty. The Prefect import is deferred and
+    wrapped: this module should remain importable (and unit-testable) outside
+    a Prefect flow context. Returns the artifact key when created, else None.
+    """
+    if not stale:
+        return None
+
+    for s in stale:
+        delete_cmd = (
+            "curl -X DELETE --cert ~/.ssl/cadcproxy.pem "
+            f"--key ~/.ssl/cadcproxy.pem {_SKAHA_SESSION_URL}/{s['id']}"
+        )
+        print(f"[reconcile_ingest] WARNING STALE skaha session  "
+              f"name={s['name']}  id={s['id']}  status={s['status']}  "
+              f"started={s['startTime']}  age={s['age_hours']:.1f}h  "
+              f"-- delete with: {delete_cmd}")
+
+    try:
+        from prefect.artifacts import create_markdown_artifact
+    except Exception:  # noqa: BLE001 - not running under Prefect; log-only is fine
+        return None
+
+    lines = [
+        "## Stale `ingest<N>` skaha sessions",
+        "",
+        f"Threshold: **{_STALE_INGEST_SESSION_HOURS} h**  "
+        f"(a real do_ingest completes in ~20-30 min).",
+        "",
+        "These sessions are overwhelmingly skaha-side ghosts and are "
+        "throttling the 3D flow by inflating the \"running\" count. "
+        "Delete manually from the CANFAR portal, or run the inline curl.",
+        "",
+        "| Session | Age (h) | Status | Started | Delete command |",
+        "|---|---|---|---|---|",
+    ]
+    for s in stale:
+        delete_cmd = (
+            f"`curl -X DELETE --cert ~/.ssl/cadcproxy.pem "
+            f"--key ~/.ssl/cadcproxy.pem {_SKAHA_SESSION_URL}/{s['id']}`"
+        )
+        lines.append(
+            f"| `{s['name']}` ({s['id']}) | {s['age_hours']:.1f} | "
+            f"{s['status']} | {s['startTime']} | {delete_cmd} |"
+        )
+    md = "\n".join(lines)
+
+    try:
+        create_markdown_artifact(key="stale-skaha-sessions", markdown=md)
+        return "stale-skaha-sessions"
+    except Exception as e:  # noqa: BLE001 - artifact create outside flow run
+        print(f"[reconcile_ingest] stale-session artifact create failed "
+              f"(not under a flow run?): {e!r}")
+        return None
+
+
 def _patch_status(conn, band_number, tile_number, new_status):
     """PATCH /3d-pipeline/tiles/update/3d_pipeline_ingest/
     with 3d_pipeline_ingest=<new_status>, or omitted to null."""
@@ -235,12 +385,20 @@ def reconcile_stuck_ingest_running(
     expected = EXPECTED_3D_PLANES
     n_expected = len(expected)
 
+    # Staleness check runs independently of the DB reconciliation below, so a
+    # stale-session alert is emitted every tick even when there are no stuck
+    # DB rows to resolve. Pure observability: we do not delete here.
+    stale_sessions = _find_stale_ingest_sessions()
+    _report_stale_sessions(stale_sessions)
+
     stuck = _get_stuck_tiles(conn, band_number)
     print(f"[reconcile_ingest] band {band_number}: {len(stuck)} tile(s) at "
           f"3d_pipeline_ingest='IngestRunning'  (strict_minoc={strict_minoc})")
     if not stuck:
         return {"flipped_ingested": 0, "nulled": 0, "left_alone": 0,
-                "orphan_partial_nulled": 0, "stuck_total": 0}
+                "orphan_partial_nulled": 0,
+                "stale_skaha_detected": len(stale_sessions),
+                "stuck_total": 0}
 
     cadc_by_tile = _cadc_p3d_planes_by_tile(stuck, band, cert_file)
     live_sessions = _live_ingest_session_tiles()
@@ -249,7 +407,9 @@ def reconcile_stuck_ingest_running(
               "nulling tiles whose session may still be running")
         return {"flipped_ingested": 0, "nulled": 0,
                 "left_alone": len(stuck),
-                "orphan_partial_nulled": 0, "stuck_total": len(stuck)}
+                "orphan_partial_nulled": 0,
+                "stale_skaha_detected": len(stale_sessions),
+                "stuck_total": len(stuck)}
 
     flipped = nulled = left_alone = orphan_partial = 0
     for tile in stuck:
@@ -309,6 +469,7 @@ def reconcile_stuck_ingest_running(
         "nulled": nulled,
         "left_alone": left_alone,
         "orphan_partial_nulled": orphan_partial,
+        "stale_skaha_detected": len(stale_sessions),
         "stuck_total": len(stuck),
     }
     print(f"[reconcile_ingest] band {band_number}: summary {summary}")
