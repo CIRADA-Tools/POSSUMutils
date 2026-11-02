@@ -11,6 +11,7 @@ from prefect import flow
 
 from automation import possum_api_client as rest_api, database_queries as db
 from possum_pipeline_control import util
+from possum_pipeline_control.reconcile_ingest import reconcile_stuck_ingest_running
 from print_all_open_sessions import get_open_sessions
 
 
@@ -219,7 +220,25 @@ def run_script_intermittently(
     
 
 @flow(name="control_3D_pipeline", log_prints=True)
-def main_flow():    
+def main_flow():
+    # Hoist the stuck-IngestRunning reconciler ABOVE the throttle gate below.
+    # run_script_intermittently() skips the whole child-script set (including
+    # check_ingest_3Dpipeline, where the reconciler lives) whenever the
+    # headless session count exceeds the throttle. The failure mode that
+    # motivated this: 2026-11-02 — 10 skaha ghost sessions kept the throttle
+    # tripped for 24h, which skipped the reconciler too, which let more
+    # IngestRunning rows accumulate, which required manual intervention to
+    # unstick. By running the reconciler unconditionally here, DB-side state
+    # self-heals even during a throttle stall. The inner call inside
+    # ingest_3Dpipeline() stays as a safety net: if this hoisted call errors,
+    # the inner one still runs on non-throttled ticks.
+    try:
+        conn = rest_api.PossumApiClient()
+        reconcile_stuck_ingest_running(band_number=1, conn=conn)
+    except Exception as e:  # noqa: BLE001 - never fail the flow on reconcile
+        print(f"[control_3D_pipeline] pre-throttle reconcile hoist failed, "
+              f"continuing: {e!r}")
+
     # Path to the script to be run intermittently
     script_paths = [
         "possum_pipeline_control.check_status_and_launch_3Dpipeline_v2",
