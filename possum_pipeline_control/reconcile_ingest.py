@@ -199,7 +199,14 @@ def _live_ingest_session_tiles():
     rather than wrongly concluding sessions are dead).
     """
     try:
-        df = get_open_sessions(verbose=False)
+        # get_open_sessions() takes no arguments in the current
+        # print_all_open_sessions.py. An earlier version accepted
+        # `verbose=False`; the kwarg was removed at some point but this
+        # call site was never updated, so from PR #15 onward every call
+        # raised TypeError and the reconciler bailed to the "skaha
+        # unavailable" branch. Hid until PR #20 hoisted the reconciler
+        # above the throttle gate and it actually started running.
+        df = get_open_sessions()
     except Exception as e:  # noqa: BLE001  - want to be defensive about skaha here
         print(f"[reconcile_ingest] skaha session fetch failed: {e!r}; "
               "treating sessions as unknown (will skip reconciliation)")
