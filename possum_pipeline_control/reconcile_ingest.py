@@ -17,7 +17,8 @@ one or more files) is caught and treated as incomplete rather than flipped:
 
 A second pass runs every tick, purely for observability: `ingest<N>` skaha
 sessions whose status is still 'Running'/'Pending' past the staleness
-threshold (default 2.5 h; a real do_ingest completes in ~20-30 min) are
+threshold (default 8 h; a nominal do_ingest completes in ~20-30 min but
+with retries + CADC congestion a legitimate run can push past 2h) are
 reported in a WARNING log line with an inline curl delete command, and
 surfaced in a Prefect Markdown artifact `stale-skaha-sessions`. Deletion is
 left to the operator — this PR adds the signal, not the action.
@@ -66,10 +67,15 @@ _MINOC_HEAD_TIMEOUT_S = 15
 
 # Threshold for marking an `ingest<N>` skaha session as stale (observability
 # only in this version — we log + emit a Prefect artifact; we do NOT delete).
-# A real do_ingest end-to-end is ~20-30 minutes; the 10 skaha ghosts we hit on
-# 2026-11-02 were 23-32h. 2.5h is ~5x typical and leaves large margin for slow
-# but legitimate runs. Operator still deletes manually.
-_STALE_INGEST_SESSION_HOURS = 2.5
+# A real do_ingest end-to-end is nominally ~20-30 min, but with `retry_count:3`
+# and `retry_failures: True` in the ingest config (set 2026-06-15), plus
+# occasional CADC/minoc congestion and caom2utils FITS verification on
+# malformed headers, a legitimate run can push past 2h. On 2026-11-02 we
+# observed tile 10438 still progressing at 2h+ and silent (not advancing) at
+# ~3h — not a clear ghost. The 10 real ghosts we hit the same day were 23-32h.
+# 8h = ~16x typical, giving generous margin for retries+congestion while still
+# catching real ghosts within one third of a day.
+_STALE_INGEST_SESSION_HOURS = 8.0
 
 # Only `ingest<N>` sessions are considered (3D-pipeline ingest sessions).
 # 1D sessions use a different name convention (<sbid>-HH-MM-SS) and can run
