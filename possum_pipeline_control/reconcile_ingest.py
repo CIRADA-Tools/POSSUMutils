@@ -76,13 +76,19 @@ has the correct value for a column, that column is not re-written.
                                                        query raises and the
                                                        whole tick aborts.)
 
+Zombie sessions (skaha API reports Running but the python process is
+dead/hung) do NOT block reconciliation. _live_ingest_session_tiles
+filters out sessions older than _STALE_INGEST_SESSION_HOURS (default 8h;
+a nominal do_ingest completes in ~20-30 min, worst-case retries push to
+~2h, so 8h is 4x the worst legit case). Without this filter, a zombie
+would be treated as a live lease and the reconciler would leave_alone
+the stuck tile indefinitely.
+
 A second pass runs every tick, purely for observability: `ingest<N>` skaha
-sessions whose status is still 'Running'/'Pending' past the staleness
-threshold (default 8 h; a nominal do_ingest completes in ~20-30 min but
-with retries + CADC congestion a legitimate run can push past 2h) are
-reported in a WARNING log line with an inline curl delete command, and
-surfaced in a Prefect Markdown artifact `stale-skaha-sessions`. Deletion is
-left to the operator — this module emits the signal, not the action.
+sessions past the staleness threshold are reported in a WARNING log line
+with an inline curl delete command, and surfaced in a Prefect Markdown
+artifact `stale-skaha-sessions`. The reporter cleans up SKAHA side (the
+curl); the reconciler cleans up DB side independently.
 
 Call reconcile_stuck_ingest_running(band_number, conn) at the start of
 check_ingest_3Dpipeline.ingest_3Dpipeline() BEFORE get_tiles_for_ingest.
@@ -296,12 +302,25 @@ def _minoc_fully_present(planes_by_product, cert_file, expected):
     return True
 
 
-def _live_ingest_session_tiles():
-    """Return the set of tile ints that have a live `ingest<N>` CANFAR session.
+def _live_ingest_session_tiles(stale_threshold_hours=_STALE_INGEST_SESSION_HOURS):
+    """Return the set of tile ints with a NON-STALE live `ingest<N>` session.
 
-    'Live' = status in {Pending, Running}. On skaha API failure, returns None
-    (sentinel so the caller treats "unknown session state" as safe no-op,
-    rather than wrongly concluding sessions are dead).
+    'Live' = status in {Pending, Running} AND age < stale_threshold_hours.
+
+    Zombie sessions (API still reports Running but the python process is
+    dead/hung) are explicitly EXCLUDED. Without this exclusion, a zombie
+    would be treated as a live lease and the reconciler would leave_alone
+    the stuck tile forever — the gap your question exposed. Age is derived
+    from skaha's startTime; sessions with no parseable startTime are
+    treated as alive (we don't know their age, be conservative and defer).
+
+    The stale-session reporter (_find_stale_ingest_sessions) still runs
+    independently and emits the curl-to-delete command + Prefect artifact
+    for operator cleanup of the skaha side. The reconciler just stops
+    waiting on those sessions before healing the DB row.
+
+    On skaha API failure, returns None (sentinel so the caller skips the
+    tick entirely, treating "unknown session state" as safe no-op).
     """
     try:
         # get_open_sessions() takes no arguments in the current
@@ -321,12 +340,26 @@ def _live_ingest_session_tiles():
     if "status" not in df.columns or "name" not in df.columns:
         return set()
     alive = df[df["status"].astype(str).str.lower().isin(_ALIVE_SKAHA_STATES)]
+    now = datetime.now(tz=timezone.utc)
     tiles = set()
-    for name in alive["name"].dropna().astype(str):
-        if name.startswith("ingest"):
-            suffix = name[len("ingest"):]
-            if suffix.isdigit():
-                tiles.add(int(suffix))
+    for _, row in alive.iterrows():
+        name = str(row["name"])
+        if not name.startswith("ingest"):
+            continue
+        suffix = name[len("ingest"):]
+        if not suffix.isdigit():
+            continue
+        start = _parse_skaha_start_time(row.get("startTime") if "startTime" in alive.columns else None)
+        if start is not None:
+            age_hours = (now - start).total_seconds() / 3600.0
+            if age_hours >= stale_threshold_hours:
+                # Zombie: skaha says Running but it's been Running for
+                # longer than any legitimate do_ingest. Do not count
+                # it as a live lease.
+                continue
+        # No startTime available → cannot age-check → be conservative
+        # and treat as alive (reconciler defers).
+        tiles.add(int(suffix))
     return tiles
 
 
@@ -593,14 +626,18 @@ def reconcile_stuck_ingest_running(
         tile_date = date_by_tile.get(tile)
         fully_consistent_cadc = tap_complete and (not strict_minoc or minoc_ok)
 
-        # Hard gate (the ONLY leave_alone case): a live ingest<N> session
-        # means do_ingest is still running. The reconciler never writes
-        # during processing — the owner (do_ingest) will write its own
-        # final state when it finishes. In every other case the
-        # reconciler reconciles the DB against CADC: no wildcards, no
-        # "needs human attention" sidelines. Persistent failures (e.g.
-        # the sc2repo underflow on tile 11719) will loop between NULL
-        # and IngestFailed; detection of such loops is the audit TODO.
+        # Hard gate (the ONLY leave_alone case): a live, NON-STALE
+        # ingest<N> session means do_ingest is still running. The
+        # reconciler never writes during processing — the owner
+        # (do_ingest) will write its own final state when it finishes.
+        # Zombie sessions (status Running but older than the staleness
+        # threshold) are filtered out of live_sessions in
+        # _live_ingest_session_tiles, so a hung session does NOT keep
+        # a tile stuck forever. In every other case the reconciler
+        # reconciles the DB against CADC: no wildcards, no "needs
+        # human attention" sidelines. Persistent failures (e.g. the
+        # sc2repo underflow on tile 11719) will loop between NULL and
+        # IngestFailed; detection of such loops is the audit TODO.
         if session_alive:
             action = "leave_alone"
             leave_reason = "session_alive"
