@@ -1,16 +1,30 @@
-"""Detect and resolve stuck 3d_pipeline_ingest='IngestRunning' tiles.
+"""Detect and resolve tiles whose 3d_pipeline_ingest state disagrees with CADC.
 
-When a CANFAR ingest headless session dies before writing its DB status back
-(CANFAR outage, OOM, crash), 3d_pipeline_ingest stays at 'IngestRunning'
-indefinitely. The pipeline then neither retries nor completes the tile.
+Two DB states need reconciliation because they can disagree with what is
+actually at CADC:
 
-This module walks the stuck list each pipeline cycle and resolves each tile
-based on real evidence (CADC + skaha), not a timeout. Verification combines a
-CAOM2 TAP plane check with a minoc HEAD on every science artifact, so the
-"orphan-partial" pattern (TAP registered 14/14 planes but minoc has 404s on
-one or more files) is caught and treated as incomplete rather than flipped:
+  * 'IngestRunning' - a CANFAR ingest headless session died before writing
+    its DB status back (CANFAR outage, OOM, crash, race with reconciler),
+    so the row stays at 'IngestRunning' indefinitely while CADC may or may
+    not have everything.
+
+  * 'IngestFailed' - the ingest flow explicitly wrote failure, usually
+    because _report.txt reported errors or possum_run raised. In the
+    "bookkeeping false-negative" (c.1a) and transient-CAOM2-repo (c.3a/b)
+    patterns the data actually did land at CADC despite the failure flag;
+    the correct final state is Ingested, not Failed, and the row needs to
+    be flipped once the TAP+minoc check passes.
+
+This module walks the union of those two lists each pipeline cycle and
+resolves each tile based on real evidence (CADC + skaha), not a timeout.
+Verification combines a CAOM2 TAP plane check with a minoc HEAD on every
+science artifact, so the "orphan-partial" pattern (TAP registered 14/14
+planes but minoc has 404s on one or more files) is caught and treated as
+incomplete rather than flipped:
 
   TAP 14/14 planes AND minoc HEAD 200 on every science URI -> PATCH 'Ingested'
+    (applies to both IngestRunning and IngestFailed; the IngestFailed path
+    is the false-negative recovery)
   CADC incomplete (TAP < 14/14, OR any minoc 404) AND no live `ingest<N>`
                                                         -> PATCH NULL (retry)
   CADC incomplete AND session alive                     -> no-op (still in flight)
@@ -96,7 +110,12 @@ _DEFAULT_CERT = os.path.expanduser("~/.ssl/cadcproxy.pem")
 
 
 def _get_stuck_tiles(conn, band_number):
-    """Return a list of tile ints whose 3d_pipeline_ingest == 'IngestRunning'."""
+    """Return a list of tile ints whose 3d_pipeline_ingest == 'IngestRunning'.
+
+    Kept for backward compatibility and single-purpose callers; the broader
+    reconciler now uses _get_stuck_tiles_by_status which also surfaces
+    IngestFailed rows.
+    """
     rows = conn.get_json(
         f"/3d-pipeline/tiles/order_by_3d_pipeline_val/band{band_number}/"
     )
@@ -108,6 +127,51 @@ def _get_stuck_tiles(conn, band_number):
             except (KeyError, TypeError, ValueError):
                 continue
     return sorted(set(stuck))
+
+
+def _get_stuck_tiles_by_status(conn, band_number):
+    """Return {tile: current_3d_pipeline_ingest} for tiles that need reconciliation.
+
+    Two statuses need the TAP+minoc truth-check:
+
+      - 'IngestRunning': the ingest flow launched but never wrote the final
+        status back (session died, race with reconciler, OOM, etc.). DB may
+        say Running while CADC either has all 14 planes (false Running) or
+        has none (truly stuck).
+
+      - 'IngestFailed': the ingest flow explicitly wrote failure, usually
+        because _report.txt reported errors or possum_run raised. Common
+        root causes include transient CAOM2 repo JDBC blips (c.3a / c.3b)
+        and bookkeeping false-negatives where files actually did land at
+        CADC (c.1a). In the false-negative case the correct final status
+        is Ingested, not Failed, and the reconciler should flip it once
+        the TAP+minoc check passes.
+
+    Rows that are already Ingested (final success) or NULL (not attempted)
+    are not returned -- those don't need reconciling.
+    """
+    out = {}
+    # IngestRunning: fetched from the order-by endpoint (same as _get_stuck_tiles)
+    for r in conn.get_json(
+        f"/3d-pipeline/tiles/order_by_3d_pipeline_val/band{band_number}/"
+    ):
+        if str(r.get("3d_pipeline_ingest", "")).strip() == "IngestRunning":
+            try:
+                out[int(r["tile"])] = "IngestRunning"
+            except (KeyError, TypeError, ValueError):
+                continue
+    # IngestFailed: dedicated endpoint already filters to just this status
+    for r in conn.get_json(
+        f"/3d-pipeline/tiles/ingest-failed/band{band_number}/"
+    ):
+        try:
+            # Don't let an IngestFailed row overwrite an IngestRunning row
+            # that happens to appear in both (shouldn't, but defensive).
+            tile = int(r["tile"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        out.setdefault(tile, "IngestFailed")
+    return out
 
 
 def _cadc_p3d_planes_by_tile(tiles, band, cert_file):
@@ -383,9 +447,16 @@ def reconcile_stuck_ingest_running(
             more files). Not recommended.
 
     Returns:
-        dict with counts: {"flipped_ingested": int, "nulled": int,
-                           "left_alone": int, "orphan_partial_nulled": int,
-                           "stuck_total": int}
+        dict with counts: {
+            "flipped_ingested": int,       # flipped from IngestRunning -> Ingested
+            "flipped_from_failed": int,    # flipped from IngestFailed -> Ingested
+                                           # (c.1a / c.3 false-negative recovery)
+            "nulled": int,                 # nulled for retry (was Running or Failed)
+            "left_alone": int,             # live session, left in flight
+            "orphan_partial_nulled": int,  # TAP 14/14 but minoc has 404s -> nulled
+            "stale_skaha_detected": int,   # 'ingest<N>' sessions past staleness
+            "stuck_total": int,            # Running + Failed input count
+        }
     """
     if band_number == 1:
         band = "943MHz"
@@ -404,28 +475,36 @@ def reconcile_stuck_ingest_running(
     stale_sessions = _find_stale_ingest_sessions()
     _report_stale_sessions(stale_sessions)
 
-    stuck = _get_stuck_tiles(conn, band_number)
-    print(f"[reconcile_ingest] band {band_number}: {len(stuck)} tile(s) at "
-          f"3d_pipeline_ingest='IngestRunning'  (strict_minoc={strict_minoc})")
-    if not stuck:
-        return {"flipped_ingested": 0, "nulled": 0, "left_alone": 0,
+    stuck_by_status = _get_stuck_tiles_by_status(conn, band_number)
+    n_running = sum(1 for s in stuck_by_status.values() if s == "IngestRunning")
+    n_failed = sum(1 for s in stuck_by_status.values() if s == "IngestFailed")
+    print(f"[reconcile_ingest] band {band_number}: "
+          f"{n_running} IngestRunning + {n_failed} IngestFailed "
+          f"= {len(stuck_by_status)} tile(s) to reconcile  "
+          f"(strict_minoc={strict_minoc})")
+    if not stuck_by_status:
+        return {"flipped_ingested": 0, "flipped_from_failed": 0,
+                "nulled": 0, "left_alone": 0,
                 "orphan_partial_nulled": 0,
                 "stale_skaha_detected": len(stale_sessions),
                 "stuck_total": 0}
 
-    cadc_by_tile = _cadc_p3d_planes_by_tile(stuck, band, cert_file)
+    tiles = sorted(stuck_by_status.keys())
+    cadc_by_tile = _cadc_p3d_planes_by_tile(tiles, band, cert_file)
     live_sessions = _live_ingest_session_tiles()
     if live_sessions is None:
         print("[reconcile_ingest] skaha unavailable; skipping to avoid "
               "nulling tiles whose session may still be running")
-        return {"flipped_ingested": 0, "nulled": 0,
-                "left_alone": len(stuck),
+        return {"flipped_ingested": 0, "flipped_from_failed": 0,
+                "nulled": 0,
+                "left_alone": len(stuck_by_status),
                 "orphan_partial_nulled": 0,
                 "stale_skaha_detected": len(stale_sessions),
-                "stuck_total": len(stuck)}
+                "stuck_total": len(stuck_by_status)}
 
-    flipped = nulled = left_alone = orphan_partial = 0
-    for tile in stuck:
+    flipped = flipped_from_failed = nulled = left_alone = orphan_partial = 0
+    for tile in tiles:
+        current_status = stuck_by_status[tile]  # 'IngestRunning' or 'IngestFailed'
         planes_by_product = cadc_by_tile.get(tile, {})
         planes_present = set(planes_by_product.keys()) & expected
         n_at_cadc = len(planes_present)
@@ -440,21 +519,32 @@ def reconcile_stuck_ingest_running(
                 orphan_partial_flag = True
 
         if tap_complete and (not strict_minoc or minoc_ok):
+            # Data is complete at CADC; safe to mark Ingested regardless of
+            # whether DB was Running (race / silent commit missing) or Failed
+            # (c.1a bookkeeping false-negative, or c.3a/b transient CAOM2 repo
+            # issue that cleared after retry).
             action = "flip_ingested"
         elif session_alive:
+            # Only applies to IngestRunning realistically; an IngestFailed
+            # tile shouldn't have a live ingest<N>, but defensively leave
+            # alone if one does appear.
             action = "leave_alone"
         else:
             action = "null_retry"
 
         minoc_tag = "" if minoc_ok is None else f" minoc_ok={minoc_ok}"
         orphan_tag = "  [ORPHAN-PARTIAL]" if orphan_partial_flag else ""
-        print(f"[reconcile_ingest] tile {tile}: p3d={n_at_cadc}/{n_expected}"
-              f"{minoc_tag}  session_alive={session_alive}  action={action}"
+        print(f"[reconcile_ingest] tile {tile} ({current_status}): "
+              f"p3d={n_at_cadc}/{n_expected}{minoc_tag}  "
+              f"session_alive={session_alive}  action={action}"
               f"{orphan_tag}  {'(DRY-RUN)' if dry_run else ''}")
 
         if dry_run:
             if action == "flip_ingested":
-                flipped += 1
+                if current_status == "IngestFailed":
+                    flipped_from_failed += 1
+                else:
+                    flipped += 1
             elif action == "null_retry":
                 nulled += 1
                 if orphan_partial_flag:
@@ -466,7 +556,10 @@ def reconcile_stuck_ingest_running(
         try:
             if action == "flip_ingested":
                 _patch_status(conn, band_number, tile, "Ingested")
-                flipped += 1
+                if current_status == "IngestFailed":
+                    flipped_from_failed += 1
+                else:
+                    flipped += 1
             elif action == "null_retry":
                 _patch_status(conn, band_number, tile, None)
                 nulled += 1
@@ -479,11 +572,12 @@ def reconcile_stuck_ingest_running(
 
     summary = {
         "flipped_ingested": flipped,
+        "flipped_from_failed": flipped_from_failed,
         "nulled": nulled,
         "left_alone": left_alone,
         "orphan_partial_nulled": orphan_partial,
         "stale_skaha_detected": len(stale_sessions),
-        "stuck_total": len(stuck),
+        "stuck_total": len(stuck_by_status),
     }
     print(f"[reconcile_ingest] band {band_number}: summary {summary}")
     return summary
