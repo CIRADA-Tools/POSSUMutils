@@ -417,38 +417,41 @@ def _flip_to_ingested_consistent(conn, band_number, band, tile_number, date):
     other writer. Mirrors the final-step bookkeeping that do_ingest performs
     on the happy path so the recovery path leaves the same observable state:
 
-      - DB: 3d_pipeline_ingest = 'Ingested'
-      - DB: 3d_pipeline = <date>   (via update_status_spreadsheet)
       - Google Sheet 'Survey Tiles - Band N' row's 3d_pipeline column = <date>
+      - DB: 3d_pipeline = <date>   (both via update_status_spreadsheet)
+      - DB: 3d_pipeline_ingest = 'Ingested'   (written LAST)
 
     `date` is the max Observation.lastModified across the tile's p3d planes,
-    the same source do_ingest.check_CADC uses. If the Google Sheet update
-    fails, we still want the DB state consistent, so the DB writes happen
-    first and the sheet update is best-effort.
-    """
-    # Status first so the DB reflects completion even if sheet write fails.
-    _patch_status(conn, band_number, tile_number, "Ingested")
+    the same source do_ingest.check_CADC uses.
 
-    # Date + sheet. Deferred imports: Google-sheet / gspread deps live in
-    # ingest3Dpipeline + util and should not become hard imports of the
+    Invariant: the status flag never advances past the other stores. We
+    write date + sheet first; the status flip is last. If anything before
+    the status flip fails, the row stays 'IngestRunning' or 'IngestFailed'
+    and the reconciler's stuck-list sweep re-picks it on the next tick.
+    update_status_spreadsheet's writes are idempotent (same date on retry),
+    so re-running the full helper is safe.
+
+    Raises on failure of either date/sheet or token load, so the caller's
+    per-tile try/except preserves the pre-flip status and no counter is
+    incremented (operator sees the error in the reconciler log and the
+    tile remains in the stuck list for the next tick).
+    """
+    # Date + sheet FIRST. Deferred imports: Google-sheet / gspread deps live
+    # in ingest3Dpipeline + util and should not become hard imports of the
     # reconcile module (keeps it importable in test environments).
     from possum_pipeline_control import util
     from possum_pipeline_control import ingest3Dpipeline
 
-    try:
-        token = util.initiate_possum_status_sheet_and_token()
-    except Exception as e:  # noqa: BLE001 - sheet is operator-visible, DB is truth
-        print(f"[reconcile_ingest] tile {tile_number}: could not load google "
-              f"sheet token ({e!r}); DB status set but date/sheet not written. "
-              "Operator may need to backfill the sheet row.")
-        return
-    try:
-        ingest3Dpipeline.update_status_spreadsheet.fn(
-            tile_number, band, token, date
-        )
-    except Exception as e:  # noqa: BLE001 - keep per-tile failures soft
-        print(f"[reconcile_ingest] tile {tile_number}: update_status_spreadsheet "
-              f"failed ({e!r}); DB status set but date/sheet may be inconsistent.")
+    token = util.initiate_possum_status_sheet_and_token()
+    ingest3Dpipeline.update_status_spreadsheet.fn(
+        tile_number, band, token, date
+    )
+
+    # Status LAST, only after date+sheet are durably written. If this call
+    # fails after the two writes above succeeded, the next tick will see
+    # the row still at IngestRunning/IngestFailed and re-run the full
+    # helper (date is the same, idempotent); the status flip then retries.
+    _patch_status(conn, band_number, tile_number, "Ingested")
 
 
 def reconcile_stuck_ingest_running(
@@ -537,34 +540,53 @@ def reconcile_stuck_ingest_running(
             if not minoc_ok:
                 orphan_partial_flag = True
 
+        tile_date = date_by_tile.get(tile)
+
         # Hard gate: a live ingest<N> session means do_ingest is still
         # running. The reconciler never writes during processing — the
         # owner (do_ingest) will write its own final state when it
         # finishes. We only act once that session is gone.
         if session_alive:
             action = "leave_alone"
+            leave_reason = "session_alive"
         elif tap_complete and (not strict_minoc or minoc_ok):
-            action = "flip_ingested"
+            if tile_date is None:
+                # TAP says 14/14 (and minoc OK) but we could not parse any
+                # Observation.lastModified for this tile. Flipping without
+                # a date would leave orphan state (status=Ingested, date=
+                # NULL) that the stuck-list sweep never re-picks. Leave
+                # alone and warn; try again next tick when TAP has usually
+                # settled.
+                action = "leave_alone"
+                leave_reason = "no_lastModified_from_tap"
+            else:
+                action = "flip_ingested"
+                leave_reason = None
         elif tap_complete and strict_minoc and not minoc_ok:
             # Orphan-partial (TAP says 14/14 but minoc has 404s).
             # Null so the pipeline retries.
             action = "null_retry"
+            leave_reason = None
         elif current_status == "IngestRunning":
             # Session died mid-upload with CADC incomplete. Null for retry.
             action = "null_retry"
+            leave_reason = None
         else:
             # IngestFailed with no products at CADC and session is gone.
             # Genuinely failed; needs human attention, not an auto-retry
             # loop. Leave the row at IngestFailed.
             action = "leave_alone"
+            leave_reason = "ingestfailed_no_products"
 
         minoc_tag = "" if minoc_ok is None else f" minoc_ok={minoc_ok}"
         orphan_tag = "  [ORPHAN-PARTIAL]" if orphan_partial_flag else ""
-        date_tag = f"  date={date_by_tile.get(tile, '?')}" if action == "flip_ingested" else ""
+        date_tag = f"  date={tile_date}" if action == "flip_ingested" else ""
+        reason_tag = f"  reason={leave_reason}" if leave_reason else ""
         print(f"[reconcile_ingest] tile {tile}: current={current_status}  "
               f"p3d={n_at_cadc}/{n_expected}{minoc_tag}  "
               f"session_alive={session_alive}  action={action}"
-              f"{date_tag}{orphan_tag}  {'(DRY-RUN)' if dry_run else ''}")
+              f"{date_tag}{reason_tag}{orphan_tag}  "
+              f"{'(DRY-RUN)' if dry_run else ''}")
 
         if dry_run:
             if action == "flip_ingested":
@@ -582,17 +604,15 @@ def reconcile_stuck_ingest_running(
 
         try:
             if action == "flip_ingested":
-                date = date_by_tile.get(tile)
-                if date is None:
-                    # TAP says 14/14 but we have no lastModified rows for
-                    # this tile — abnormal. Set the status only and warn.
-                    print(f"[reconcile_ingest] tile {tile}: no lastModified "
-                          "from TAP; writing status only, no date.")
-                    _patch_status(conn, band_number, tile, "Ingested")
-                else:
-                    _flip_to_ingested_consistent(
-                        conn, band_number, band, tile, date
-                    )
+                # tile_date is guaranteed non-None here (the decision block
+                # routes no-date tiles to leave_alone). _flip_to_ingested_
+                # consistent writes date+sheet FIRST, status LAST, so any
+                # failure before the status flip leaves the row at
+                # IngestRunning/IngestFailed and the reconciler re-picks
+                # it on the next tick.
+                _flip_to_ingested_consistent(
+                    conn, band_number, band, tile, tile_date
+                )
                 if current_status == "IngestRunning":
                     flipped_running += 1
                 else:
