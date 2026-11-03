@@ -23,24 +23,33 @@ Three post-processing cases need reconciling:
      NULL. Drift left by the earlier reconciler-during-processing race
      (e.g. tiles 5617, 11418). Backfill the date from TAP.
 
-Decision table (session_alive is a hard gate — if True, we leave_alone):
+Decision table (session_alive is the ONLY leave_alone case — if True,
+not our write. Every other case reconciles the DB against CADC):
 
-  session_alive                                 -> leave_alone (in flight)
+  session_alive                                 -> leave_alone
 
   IngestRunning / IngestFailed:
-    tap_complete + minoc_ok + date present      -> flip_ingested
+    tap_complete + minoc_ok                     -> flip_ingested
          (writes DB date FIRST, DB status LAST — status never advances
-          past the date)
-    tap_complete + minoc_ok + no date from TAP  -> leave_alone (TAP yet to
-                                                   settle; retry next tick)
+          past the date. Date = max TAP lastModified, or today's date
+          as rare fallback.)
     tap_complete + any minoc 404                -> null_retry (orphan-partial)
-    tap_incomplete, IngestRunning               -> null_retry (session died)
-    tap_incomplete, IngestFailed                -> leave_alone (truly failed)
+    tap_incomplete                              -> null_retry (incomplete;
+                                                   covers both died-mid-upload
+                                                   and genuinely-failed cases)
 
   IngestedNoDate:
-    tap_complete + minoc_ok + date from TAP     -> backfill_date (no status flip)
-    tap_complete + minoc_ok + no date from TAP  -> leave_alone (retry next tick)
-    otherwise (CADC disagrees with DB=Ingested) -> leave_alone (needs operator)
+    tap_complete + minoc_ok                     -> backfill_date (no status flip)
+    otherwise (CADC disagrees with DB=Ingested) -> null_retry (DB wrong; trust
+                                                   CADC. Transient TAP errors
+                                                   abort the tick before this
+                                                   branch — _cadc_p3d_planes_
+                                                   by_tile raises on TAP
+                                                   failure.)
+
+Persistent failures (e.g. tile 11719's deterministic sc2repo underflow)
+will cycle between NULL and IngestFailed each tick. Detecting that loop
+and alerting on it is tracked in the audit TODO (future PR).
 
 A second pass runs every tick, purely for observability: `ingest<N>` skaha
 sessions whose status is still 'Running'/'Pending' past the staleness
@@ -559,59 +568,46 @@ def reconcile_stuck_ingest_running(
         tile_date = date_by_tile.get(tile)
         fully_consistent_cadc = tap_complete and (not strict_minoc or minoc_ok)
 
-        # Hard gate: a live ingest<N> session means do_ingest is still
-        # running. The reconciler never writes during processing — the
-        # owner (do_ingest) will write its own final state when it
-        # finishes. We only act once that session is gone.
+        # Hard gate (the ONLY leave_alone case): a live ingest<N> session
+        # means do_ingest is still running. The reconciler never writes
+        # during processing — the owner (do_ingest) will write its own
+        # final state when it finishes. In every other case the
+        # reconciler reconciles the DB against CADC: no wildcards, no
+        # "needs human attention" sidelines. Persistent failures (e.g.
+        # the sc2repo underflow on tile 11719) will loop between NULL
+        # and IngestFailed; detection of such loops is the audit TODO.
         if session_alive:
             action = "leave_alone"
             leave_reason = "session_alive"
         elif current_status == "IngestedNoDate":
-            # Row says Ingested on the DB but date column is NULL — drift
-            # from an earlier reconciler-during-processing race. Backfill
-            # the date from TAP's max(lastModified) when TAP+minoc confirm
-            # the ingest, mirroring do_ingest.check_CADC's date source.
-            if fully_consistent_cadc and tile_date is not None:
+            # DB status is 'Ingested' but date column is NULL. Reconcile
+            # against CADC: if CADC agrees, backfill the date; if CADC
+            # disagrees, trust CADC and NULL the status so the pipeline
+            # re-ingests. Transient TAP failure is NOT masqueraded as
+            # "disagrees": _cadc_p3d_planes_by_tile raises on TAP error
+            # and we abort the tick before reaching this branch.
+            if fully_consistent_cadc:
                 action = "backfill_date"
                 leave_reason = None
-            elif fully_consistent_cadc and tile_date is None:
-                action = "leave_alone"
-                leave_reason = "nodate_no_lastModified_from_tap"
             else:
-                # Status=Ingested on DB but CADC disagrees (TAP incomplete
-                # or minoc 404s). That's a weirder inconsistency the
-                # reconciler is not safe to auto-resolve; needs operator.
-                action = "leave_alone"
-                leave_reason = "ingested_but_cadc_incomplete"
-        elif fully_consistent_cadc:
-            if tile_date is None:
-                # TAP says 14/14 (and minoc OK) but we could not parse any
-                # Observation.lastModified for this tile. Flipping without
-                # a date would leave orphan state (status=Ingested, date=
-                # NULL) that the stuck-list sweep now catches via the
-                # IngestedNoDate case — but it's still wasteful to go
-                # through the flip just to re-visit next tick. Leave
-                # alone until TAP settles.
-                action = "leave_alone"
-                leave_reason = "no_lastModified_from_tap"
-            else:
-                action = "flip_ingested"
+                action = "null_retry"
                 leave_reason = None
+        elif fully_consistent_cadc:
+            action = "flip_ingested"
+            leave_reason = None
         elif tap_complete and strict_minoc and not minoc_ok:
             # Orphan-partial (TAP says 14/14 but minoc has 404s).
-            # Null so the pipeline retries.
-            action = "null_retry"
-            leave_reason = None
-        elif current_status == "IngestRunning":
-            # Session died mid-upload with CADC incomplete. Null for retry.
             action = "null_retry"
             leave_reason = None
         else:
-            # IngestFailed with no products at CADC and session is gone.
-            # Genuinely failed; needs human attention, not an auto-retry
-            # loop. Leave the row at IngestFailed.
-            action = "leave_alone"
-            leave_reason = "ingestfailed_no_products"
+            # tap_incomplete, for either IngestRunning (session died
+            # mid-upload) or IngestFailed (never completed). Both
+            # reconcile to NULL so the pipeline retries. If the
+            # underlying failure is persistent, the next tick will
+            # see the same incomplete state and null again; audit TODO
+            # (future PR) will flag tiles stuck in this loop.
+            action = "null_retry"
+            leave_reason = None
 
         minoc_tag = "" if minoc_ok is None else f" minoc_ok={minoc_ok}"
         orphan_tag = "  [ORPHAN-PARTIAL]" if orphan_partial_flag else ""
@@ -644,14 +640,18 @@ def reconcile_stuck_ingest_running(
 
         try:
             if action == "flip_ingested":
-                # tile_date is guaranteed non-None here (the decision
-                # block routes no-date tiles to leave_alone).
                 # _write_consistent_ingested writes date FIRST, status
                 # LAST, so any failure before the status flip leaves
                 # the row at IngestRunning/IngestFailed and the
                 # reconciler re-picks it on the next tick.
+                # tile_date fallback: TAP has 14/14 and minoc OK but no
+                # parseable lastModified (extremely rare — ISO-8601
+                # parse should always succeed on CAOM2). Use today's
+                # date so the DB has a concrete value and the row
+                # exits the stuck list rather than looping.
+                write_date = tile_date or datetime.now(tz=timezone.utc).date().isoformat()
                 _write_consistent_ingested(
-                    conn, band_number, tile, tile_date
+                    conn, band_number, tile, write_date
                 )
                 if current_status == "IngestRunning":
                     flipped_running += 1
@@ -659,8 +659,10 @@ def reconcile_stuck_ingest_running(
                     flipped_failed += 1
             elif action == "backfill_date":
                 # Status is already 'Ingested'; only the date is missing.
-                # Write just the date; do not re-flip status.
-                _patch_date(conn, band_number, tile, tile_date)
+                # Write just the date; do not re-flip status. Same
+                # fallback as flip_ingested.
+                write_date = tile_date or datetime.now(tz=timezone.utc).date().isoformat()
+                _patch_date(conn, band_number, tile, write_date)
                 date_backfilled += 1
             elif action == "null_retry":
                 _patch_status(conn, band_number, tile, None)
