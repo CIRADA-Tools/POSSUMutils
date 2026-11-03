@@ -141,10 +141,20 @@ def update_tile_database(tile_number, band_str, status, test_flag, conn):
     if len(rows) > 0:
         ingest_value = rows[0]["3d_pipeline_ingest"]
         if not test_flag:
-            # Status should be "IngestRunning" otherwise something went wrong
+            if ingest_value == status:
+                # Reconciler (or a prior run) already wrote the same final status
+                # we were about to write. Return without raising so the caller's
+                # downstream bookkeeping (date column + Google sheet) still runs.
+                print(
+                    f"Tile {tile_number} '3d_pipeline_ingest' already '{status}'; "
+                    "skipping redundant PATCH and continuing to date/sheet update."
+                )
+                return
+            # Current status must be "IngestRunning" to proceed with a change.
             if ingest_value != "IngestRunning":
                 raise ValueError(
-                    f"Found status {ingest_value} while it should be 'IngestRunning'"
+                    f"Found status {ingest_value} while it should be 'IngestRunning' "
+                    f"(attempting to write '{status}')"
                 )
         else:
             print(
