@@ -346,7 +346,7 @@ def update_validation_status(
     """
     print("Updating partial tile status in the POSSUM pipeline validation sheet.")
     conn = rest_api.PossumApiClient(database_config_path)
-    response = conn.patch("/1d-pipeline/observations/update/1d-pipeline-validation/?"
+    response = conn.patch("/1d-pipeline/observations/update/1d_pipeline_validation/?"
                             f"band_number={band_number}&"
                             f"field_name={field_name}&"
                             "status=Running")
