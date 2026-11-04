@@ -1,41 +1,94 @@
-"""Detect and resolve tiles whose 3d_pipeline_ingest state disagrees with CADC.
+"""Reconcile DB state against CADC + minoc + skaha once ingest is done.
 
-Two DB states need reconciliation because they can disagree with what is
-actually at CADC:
+The reconciler keeps the DB consistent with the three sources of truth
+(CADC TAP, minoc, skaha session state). The Google Status Sheet is a
+derived display, not an authority, and is intentionally NOT written here
+— keeping it in sync is a separate concern.
 
-  * 'IngestRunning' - a CANFAR ingest headless session died before writing
-    its DB status back (CANFAR outage, OOM, crash, race with reconciler),
-    so the row stays at 'IngestRunning' indefinitely while CADC may or may
-    not have everything.
+The reconciler never writes during processing. A live `ingest<N>` skaha
+session owns the status write for that tile; the reconciler only acts
+once the session is gone. Earlier revisions wrote during processing and
+raced with do_ingest, leaving the DB status flipped by the reconciler
+and the date column empty because do_ingest's own write path raised on
+the already-changed status.
 
-  * 'IngestFailed' - the ingest flow explicitly wrote failure, usually
-    because _report.txt reported errors or possum_run raised. In the
-    "bookkeeping false-negative" (c.1a) and transient-CAOM2-repo (c.3a/b)
-    patterns the data actually did land at CADC despite the failure flag;
-    the correct final state is Ingested, not Failed, and the row needs to
-    be flipped once the TAP+minoc check passes.
+Three post-processing cases need reconciling:
+  - 'IngestRunning': do_ingest's status write never landed (CANFAR outage,
+     OOM, crash). Session is gone.
+  - 'IngestFailed': do_ingest marked the row failed but a complete set of
+     products may still be present at CADC (transient per-file errors on
+     a run that nonetheless uploaded everything, or a prior partial run
+     already published the planes).
+  - 'IngestedNoDate': status='Ingested' but 3d_pipeline date column is
+     NULL. Drift left by the earlier reconciler-during-processing race
+     (e.g. tiles 5617, 11418). Backfill the date from TAP.
 
-This module walks the union of those two lists each pipeline cycle and
-resolves each tile based on real evidence (CADC + skaha), not a timeout.
-Verification combines a CAOM2 TAP plane check with a minoc HEAD on every
-science artifact, so the "orphan-partial" pattern (TAP registered 14/14
-planes but minoc has 404s on one or more files) is caught and treated as
-incomplete rather than flipped:
+Decision table (session_alive=True is the ONLY leave_alone case).
 
-  TAP 14/14 planes AND minoc HEAD 200 on every science URI -> PATCH 'Ingested'
-    (applies to both IngestRunning and IngestFailed; the IngestFailed path
-    is the false-negative recovery)
-  CADC incomplete (TAP < 14/14, OR any minoc 404) AND no live `ingest<N>`
-                                                        -> PATCH NULL (retry)
-  CADC incomplete AND session alive                     -> no-op (still in flight)
+Every row below assumes session_alive=False (do_ingest not in flight).
+When session_alive=True we leave_alone regardless of any other state.
+
+Only-touch-what-needs-touching: writes are minimal. If the DB already
+has the correct value for a column, that column is not re-written.
+
+  Current DB state         CADC state                 Action
+  --------------------------------------------------------------------
+  IngestRunning,           TAP 14/14 + minoc OK       flip to Ingested
+    date MISSING                                        - write date, then status
+                                                        - date = max TAP
+                                                          lastModified (today
+                                                          as rare fallback)
+
+  IngestRunning,           TAP 14/14 + minoc OK       flip to Ingested
+    date PRESENT                                        - skip date PATCH
+                                                        - write status only
+
+  IngestRunning            TAP 14/14 + minoc 404      null (orphan-partial;
+                                                       pipeline retries)
+
+  IngestRunning            TAP < 14/14                null (incomplete;
+                                                       session died mid-upload)
+
+  IngestFailed, any date   TAP 14/14 + minoc OK       flip to Ingested
+                                                       (same date rule as
+                                                        IngestRunning)
+
+  IngestFailed             TAP 14/14 + minoc 404      null (orphan-partial)
+
+  IngestFailed             TAP < 14/14                null (truly failed on
+                                                       this attempt; let the
+                                                       pipeline retry. If the
+                                                       underlying failure is
+                                                       persistent — e.g. tile
+                                                       11719's sc2repo
+                                                       underflow — this cycles
+                                                       each tick. Detection
+                                                       lives in the audit TODO.)
+
+  Ingested, date MISSING   TAP 14/14 + minoc OK       backfill_date
+    ('IngestedNoDate')                                  - write date only
+                                                        - status untouched
+
+  Ingested, date MISSING   anything else              null (DB wrong per CADC;
+    ('IngestedNoDate')                                  trust CADC. Transient
+                                                       TAP outages don't reach
+                                                       this branch — the TAP
+                                                       query raises and the
+                                                       whole tick aborts.)
+
+Zombie sessions (skaha API reports Running but the python process is
+dead/hung) do NOT block reconciliation. _live_ingest_session_tiles
+filters out sessions older than _STALE_INGEST_SESSION_HOURS (default 8h;
+a nominal do_ingest completes in ~20-30 min, worst-case retries push to
+~2h, so 8h is 4x the worst legit case). Without this filter, a zombie
+would be treated as a live lease and the reconciler would leave_alone
+the stuck tile indefinitely.
 
 A second pass runs every tick, purely for observability: `ingest<N>` skaha
-sessions whose status is still 'Running'/'Pending' past the staleness
-threshold (default 8 h; a nominal do_ingest completes in ~20-30 min but
-with retries + CADC congestion a legitimate run can push past 2h) are
-reported in a WARNING log line with an inline curl delete command, and
-surfaced in a Prefect Markdown artifact `stale-skaha-sessions`. Deletion is
-left to the operator — this PR adds the signal, not the action.
+sessions past the staleness threshold are reported in a WARNING log line
+with an inline curl delete command, and surfaced in a Prefect Markdown
+artifact `stale-skaha-sessions`. The reporter cleans up SKAHA side (the
+curl); the reconciler cleans up DB side independently.
 
 Call reconcile_stuck_ingest_running(band_number, conn) at the start of
 check_ingest_3Dpipeline.ingest_3Dpipeline() BEFORE get_tiles_for_ingest.
@@ -109,89 +162,73 @@ _SKAHA_SESSION_URL = "https://ws-uv.canfar.net/skaha/v1/session"
 _DEFAULT_CERT = os.path.expanduser("~/.ssl/cadcproxy.pem")
 
 
-def _get_stuck_tiles(conn, band_number):
-    """Return a list of tile ints whose 3d_pipeline_ingest == 'IngestRunning'.
+def _get_stuck_tiles_by_status(conn, band_number):
+    """Return {tile: (status_label, has_date)} for every tile the reconciler
+    may need to look at.
 
-    Kept for backward compatibility and single-purpose callers; the broader
-    reconciler now uses _get_stuck_tiles_by_status which also surfaces
-    IngestFailed rows.
+    `has_date` captures whether the DB's `3d_pipeline` (date) column is
+    already populated. It lets the main loop apply the "only write what's
+    missing" rule: when flipping a stuck row to Ingested, skip the date
+    write if the DB already has one.
+
+    Three post-processing cases:
+      - 'IngestRunning': do_ingest's status write never landed (CANFAR
+         outage, OOM, crash). The ingest skaha session may or may not still
+         be alive; the main loop uses session_alive to decide.
+      - 'IngestFailed': do_ingest marked the row failed but a complete set
+         of products may still be present at CADC.
+      - 'IngestedNoDate': 3d_pipeline_ingest='Ingested' but 3d_pipeline
+         (the date column) is NULL. Drift left by the earlier reconciler-
+         during-processing race (e.g. tiles 5617, 11418). Backfill the
+         date from TAP's max(lastModified).
+
+    'Ingested + no date' uses a dedicated label (not the raw 'Ingested')
+    because the action is different: no status flip, just a date write.
     """
     rows = conn.get_json(
         f"/3d-pipeline/tiles/order_by_3d_pipeline_val/band{band_number}/"
     )
-    stuck = []
-    for r in rows:
-        if str(r.get("3d_pipeline_ingest", "")).strip() == "IngestRunning":
-            try:
-                stuck.append(int(r["tile"]))
-            except (KeyError, TypeError, ValueError):
-                continue
-    return sorted(set(stuck))
-
-
-def _get_stuck_tiles_by_status(conn, band_number):
-    """Return {tile: current_3d_pipeline_ingest} for tiles that need reconciliation.
-
-    Two statuses need the TAP+minoc truth-check:
-
-      - 'IngestRunning': the ingest flow launched but never wrote the final
-        status back (session died, race with reconciler, OOM, etc.). DB may
-        say Running while CADC either has all 14 planes (false Running) or
-        has none (truly stuck).
-
-      - 'IngestFailed': the ingest flow explicitly wrote failure, usually
-        because _report.txt reported errors or possum_run raised. Common
-        root causes include transient CAOM2 repo JDBC blips (c.3a / c.3b)
-        and bookkeeping false-negatives where files actually did land at
-        CADC (c.1a). In the false-negative case the correct final status
-        is Ingested, not Failed, and the reconciler should flip it once
-        the TAP+minoc check passes.
-
-    Rows that are already Ingested (final success) or NULL (not attempted)
-    are not returned -- those don't need reconciling.
-    """
     out = {}
-    # IngestRunning: fetched from the order-by endpoint (same as _get_stuck_tiles)
-    for r in conn.get_json(
-        f"/3d-pipeline/tiles/order_by_3d_pipeline_val/band{band_number}/"
-    ):
-        if str(r.get("3d_pipeline_ingest", "")).strip() == "IngestRunning":
-            try:
-                out[int(r["tile"])] = "IngestRunning"
-            except (KeyError, TypeError, ValueError):
-                continue
-    # IngestFailed: dedicated endpoint already filters to just this status
-    for r in conn.get_json(
-        f"/3d-pipeline/tiles/ingest-failed/band{band_number}/"
-    ):
+    for r in rows:
+        current = str(r.get("3d_pipeline_ingest", "")).strip()
+        date_val = r.get("3d_pipeline")
+        date_str = str(date_val).strip() if date_val is not None else ""
+        has_date = date_str not in ("", "None")
         try:
-            # Don't let an IngestFailed row overwrite an IngestRunning row
-            # that happens to appear in both (shouldn't, but defensive).
-            tile = int(r["tile"])
+            tile_id = int(r["tile"])
         except (KeyError, TypeError, ValueError):
             continue
-        out.setdefault(tile, "IngestFailed")
+        if current in ("IngestRunning", "IngestFailed"):
+            out[tile_id] = (current, has_date)
+        elif current == "Ingested" and not has_date:
+            out[tile_id] = ("IngestedNoDate", False)
     return out
 
 
 def _cadc_p3d_planes_by_tile(tiles, band, cert_file):
-    """One TAP query returning {tile: {productID: [science_uri, ...]}}.
+    """One TAP query returning (planes_by_tile, last_modified_by_tile).
+
+    planes_by_tile: {tile: {productID: [science_uri, ...]}}
+    last_modified_by_tile: {tile: 'YYYY-MM-DD'}  (max Observation.lastModified
+                                                  across the tile's planes;
+                                                  mirrors ingest3Dpipeline.check_CADC)
 
     Only *_p3d_v1 planes are counted and only artifacts with
     productType='science' are kept (previews are skipped — not needed for
-    minoc verification). Tiles with no artifacts at CADC map to {}.
+    minoc verification). Tiles with no artifacts at CADC map to {}, and are
+    absent from last_modified_by_tile.
     """
     os.environ["CADCTAP_SERVICE_URI"] = "ivo://cadc.nrc.ca/ams/cirada"
     sess = cadc.Cadc()
     sess.login(certificate_file=cert_file)
 
     if not tiles:
-        return {}
+        return {}, {}
     like_clauses = " OR ".join(
         f"o.observationID LIKE '{band}_%_{t}_v1'" for t in tiles
     )
     query = f"""
-    SELECT o.observationID, p.productID, a.uri, a.productType
+    SELECT o.observationID, o.lastModified, p.productID, a.uri, a.productType
     FROM caom2.Observation o
     JOIN caom2.Plane p ON o.obsID = p.obsID
     JOIN caom2.Artifact a ON p.planeID = a.planeID
@@ -205,6 +242,7 @@ def _cadc_p3d_planes_by_tile(tiles, band, cert_file):
     result = async_q.fetch_result().to_table()
 
     out = {t: {} for t in tiles}
+    last_mod = {}
     for row in result:
         if str(row["productType"]).lower() != "science":
             continue
@@ -215,9 +253,18 @@ def _cadc_p3d_planes_by_tile(tiles, band, cert_file):
             tile = int(obs.rsplit("_v1", 1)[0].rsplit("_", 1)[1])
         except (IndexError, ValueError):
             continue
-        if tile in out:
-            out[tile].setdefault(pid, []).append(uri)
-    return out
+        if tile not in out:
+            continue
+        out[tile].setdefault(pid, []).append(uri)
+        try:
+            dt = datetime.fromisoformat(str(row["lastModified"]))
+        except (ValueError, TypeError):
+            continue
+        prev = last_mod.get(tile)
+        if prev is None or dt > prev:
+            last_mod[tile] = dt
+    date_by_tile = {t: dt.date().isoformat() for t, dt in last_mod.items()}
+    return out, date_by_tile
 
 
 def _head_minoc(uri, cert_file):
@@ -255,12 +302,25 @@ def _minoc_fully_present(planes_by_product, cert_file, expected):
     return True
 
 
-def _live_ingest_session_tiles():
-    """Return the set of tile ints that have a live `ingest<N>` CANFAR session.
+def _live_ingest_session_tiles(stale_threshold_hours=_STALE_INGEST_SESSION_HOURS):
+    """Return the set of tile ints with a NON-STALE live `ingest<N>` session.
 
-    'Live' = status in {Pending, Running}. On skaha API failure, returns None
-    (sentinel so the caller treats "unknown session state" as safe no-op,
-    rather than wrongly concluding sessions are dead).
+    'Live' = status in {Pending, Running} AND age < stale_threshold_hours.
+
+    Zombie sessions (API still reports Running but the python process is
+    dead/hung) are explicitly EXCLUDED. Without this exclusion, a zombie
+    would be treated as a live lease and the reconciler would leave_alone
+    the stuck tile forever — the gap your question exposed. Age is derived
+    from skaha's startTime; sessions with no parseable startTime are
+    treated as alive (we don't know their age, be conservative and defer).
+
+    The stale-session reporter (_find_stale_ingest_sessions) still runs
+    independently and emits the curl-to-delete command + Prefect artifact
+    for operator cleanup of the skaha side. The reconciler just stops
+    waiting on those sessions before healing the DB row.
+
+    On skaha API failure, returns None (sentinel so the caller skips the
+    tick entirely, treating "unknown session state" as safe no-op).
     """
     try:
         # get_open_sessions() takes no arguments in the current
@@ -280,12 +340,26 @@ def _live_ingest_session_tiles():
     if "status" not in df.columns or "name" not in df.columns:
         return set()
     alive = df[df["status"].astype(str).str.lower().isin(_ALIVE_SKAHA_STATES)]
+    now = datetime.now(tz=timezone.utc)
     tiles = set()
-    for name in alive["name"].dropna().astype(str):
-        if name.startswith("ingest"):
-            suffix = name[len("ingest"):]
-            if suffix.isdigit():
-                tiles.add(int(suffix))
+    for _, row in alive.iterrows():
+        name = str(row["name"])
+        if not name.startswith("ingest"):
+            continue
+        suffix = name[len("ingest"):]
+        if not suffix.isdigit():
+            continue
+        start = _parse_skaha_start_time(row.get("startTime") if "startTime" in alive.columns else None)
+        if start is not None:
+            age_hours = (now - start).total_seconds() / 3600.0
+            if age_hours >= stale_threshold_hours:
+                # Zombie: skaha says Running but it's been Running for
+                # longer than any legitimate do_ingest. Do not count
+                # it as a live lease.
+                continue
+        # No startTime available → cannot age-check → be conservative
+        # and treat as alive (reconciler defers).
+        tiles.add(int(suffix))
     return tiles
 
 
@@ -426,6 +500,39 @@ def _patch_status(conn, band_number, tile_number, new_status):
     return conn.patch(endpoint)
 
 
+def _patch_date(conn, band_number, tile_number, date):
+    """PATCH /3d-pipeline/tiles/update/3d_pipeline/ with the ingest date.
+
+    Mirrors the DB-side write that ingest3Dpipeline.update_status_spreadsheet
+    performs at the end of do_ingest. The Google Sheet write is intentionally
+    NOT performed by the reconciler: the sheet is a derived display, not a
+    source of truth, and keeping it in sync is a separate concern. Sources
+    of truth consulted by the reconciler are DB + TAP + minoc + skaha.
+    """
+    return conn.patch(
+        "/3d-pipeline/tiles/update/3d_pipeline/",
+        json={
+            "band_number": band_number,
+            "tile_number": tile_number,
+            "timestamp": date,
+        },
+    )
+
+
+def _write_consistent_ingested(conn, band_number, tile_number, date):
+    """Write date then flip status to 'Ingested' (date first, status last).
+
+    Called when the reconciler is replacing a stuck IngestRunning or
+    IngestFailed status with a confirmed Ingested state. The write order
+    enforces an invariant: the status flag never advances past the date.
+    If _patch_date fails, status stays at IngestRunning/IngestFailed and
+    the reconciler's stuck-list sweep re-picks the row on the next tick
+    (_patch_date is idempotent — same date on retry).
+    """
+    _patch_date(conn, band_number, tile_number, date)
+    _patch_status(conn, band_number, tile_number, "Ingested")
+
+
 def reconcile_stuck_ingest_running(
     band_number,
     conn,
@@ -447,16 +554,9 @@ def reconcile_stuck_ingest_running(
             more files). Not recommended.
 
     Returns:
-        dict with counts: {
-            "flipped_ingested": int,       # flipped from IngestRunning -> Ingested
-            "flipped_from_failed": int,    # flipped from IngestFailed -> Ingested
-                                           # (c.1a / c.3 false-negative recovery)
-            "nulled": int,                 # nulled for retry (was Running or Failed)
-            "left_alone": int,             # live session, left in flight
-            "orphan_partial_nulled": int,  # TAP 14/14 but minoc has 404s -> nulled
-            "stale_skaha_detected": int,   # 'ingest<N>' sessions past staleness
-            "stuck_total": int,            # Running + Failed input count
-        }
+        dict with counts: {"flipped_ingested": int, "nulled": int,
+                           "left_alone": int, "orphan_partial_nulled": int,
+                           "stuck_total": int}
     """
     if band_number == 1:
         band = "943MHz"
@@ -476,75 +576,123 @@ def reconcile_stuck_ingest_running(
     _report_stale_sessions(stale_sessions)
 
     stuck_by_status = _get_stuck_tiles_by_status(conn, band_number)
-    n_running = sum(1 for s in stuck_by_status.values() if s == "IngestRunning")
-    n_failed = sum(1 for s in stuck_by_status.values() if s == "IngestFailed")
-    print(f"[reconcile_ingest] band {band_number}: "
-          f"{n_running} IngestRunning + {n_failed} IngestFailed "
-          f"= {len(stuck_by_status)} tile(s) to reconcile  "
-          f"(strict_minoc={strict_minoc})")
+    n_running = sum(1 for s, _ in stuck_by_status.values() if s == "IngestRunning")
+    n_failed = sum(1 for s, _ in stuck_by_status.values() if s == "IngestFailed")
+    n_nodate = sum(1 for s, _ in stuck_by_status.values() if s == "IngestedNoDate")
+    print(f"[reconcile_ingest] band {band_number}: {len(stuck_by_status)} tile(s) "
+          f"to review  (IngestRunning={n_running}, IngestFailed={n_failed}, "
+          f"IngestedNoDate={n_nodate}, strict_minoc={strict_minoc})")
     if not stuck_by_status:
-        return {"flipped_ingested": 0, "flipped_from_failed": 0,
-                "nulled": 0, "left_alone": 0,
-                "orphan_partial_nulled": 0,
+        return {"flipped_from_running": 0, "flipped_from_failed": 0,
+                "date_backfilled": 0,
+                "nulled": 0, "left_alone": 0, "orphan_partial_nulled": 0,
                 "stale_skaha_detected": len(stale_sessions),
                 "stuck_total": 0}
 
-    tiles = sorted(stuck_by_status.keys())
-    cadc_by_tile = _cadc_p3d_planes_by_tile(tiles, band, cert_file)
+    stuck_tiles = sorted(stuck_by_status.keys())
+    cadc_by_tile, date_by_tile = _cadc_p3d_planes_by_tile(
+        stuck_tiles, band, cert_file
+    )
     live_sessions = _live_ingest_session_tiles()
     if live_sessions is None:
-        print("[reconcile_ingest] skaha unavailable; skipping to avoid "
-              "nulling tiles whose session may still be running")
-        return {"flipped_ingested": 0, "flipped_from_failed": 0,
-                "nulled": 0,
-                "left_alone": len(stuck_by_status),
+        # Session state is the hard gate that prevents writing during
+        # processing. Without it we cannot distinguish "ingest in flight"
+        # from "session dead", so we skip the whole tick — no writes.
+        print("[reconcile_ingest] skaha unavailable; skipping (will not write "
+              "during unknown session state)")
+        return {"flipped_from_running": 0, "flipped_from_failed": 0,
+                "date_backfilled": 0,
+                "nulled": 0, "left_alone": len(stuck_by_status),
                 "orphan_partial_nulled": 0,
                 "stale_skaha_detected": len(stale_sessions),
                 "stuck_total": len(stuck_by_status)}
 
-    flipped = flipped_from_failed = nulled = left_alone = orphan_partial = 0
-    for tile in tiles:
-        current_status = stuck_by_status[tile]  # 'IngestRunning' or 'IngestFailed'
+    flipped_running = flipped_failed = date_backfilled = 0
+    nulled = left_alone = orphan_partial = 0
+    for tile, (current_status, db_has_date) in stuck_by_status.items():
         planes_by_product = cadc_by_tile.get(tile, {})
         planes_present = set(planes_by_product.keys()) & expected
         n_at_cadc = len(planes_present)
         session_alive = tile in live_sessions
         tap_complete = n_at_cadc >= n_expected
 
-        minoc_ok = None  # only computed when tap_complete
+        minoc_ok = None
         orphan_partial_flag = False
         if tap_complete and strict_minoc:
             minoc_ok = _minoc_fully_present(planes_by_product, cert_file, expected)
             if not minoc_ok:
                 orphan_partial_flag = True
 
-        if tap_complete and (not strict_minoc or minoc_ok):
-            # Data is complete at CADC; safe to mark Ingested regardless of
-            # whether DB was Running (race / silent commit missing) or Failed
-            # (c.1a bookkeeping false-negative, or c.3a/b transient CAOM2 repo
-            # issue that cleared after retry).
-            action = "flip_ingested"
-        elif session_alive:
-            # Only applies to IngestRunning realistically; an IngestFailed
-            # tile shouldn't have a live ingest<N>, but defensively leave
-            # alone if one does appear.
+        tile_date = date_by_tile.get(tile)
+        fully_consistent_cadc = tap_complete and (not strict_minoc or minoc_ok)
+
+        # Hard gate (the ONLY leave_alone case): a live, NON-STALE
+        # ingest<N> session means do_ingest is still running. The
+        # reconciler never writes during processing — the owner
+        # (do_ingest) will write its own final state when it finishes.
+        # Zombie sessions (status Running but older than the staleness
+        # threshold) are filtered out of live_sessions in
+        # _live_ingest_session_tiles, so a hung session does NOT keep
+        # a tile stuck forever. In every other case the reconciler
+        # reconciles the DB against CADC: no wildcards, no "needs
+        # human attention" sidelines. Persistent failures (e.g. the
+        # sc2repo underflow on tile 11719) will loop between NULL and
+        # IngestFailed; detection of such loops is the audit TODO.
+        if session_alive:
             action = "leave_alone"
-        else:
+            leave_reason = "session_alive"
+        elif current_status == "IngestedNoDate":
+            # DB status is 'Ingested' but date column is NULL. Reconcile
+            # against CADC: if CADC agrees, backfill the date; if CADC
+            # disagrees, trust CADC and NULL the status so the pipeline
+            # re-ingests. Transient TAP failure is NOT masqueraded as
+            # "disagrees": _cadc_p3d_planes_by_tile raises on TAP error
+            # and we abort the tick before reaching this branch.
+            if fully_consistent_cadc:
+                action = "backfill_date"
+                leave_reason = None
+            else:
+                action = "null_retry"
+                leave_reason = None
+        elif fully_consistent_cadc:
+            action = "flip_ingested"
+            leave_reason = None
+        elif tap_complete and strict_minoc and not minoc_ok:
+            # Orphan-partial (TAP says 14/14 but minoc has 404s).
             action = "null_retry"
+            leave_reason = None
+        else:
+            # tap_incomplete, for either IngestRunning (session died
+            # mid-upload) or IngestFailed (never completed). Both
+            # reconcile to NULL so the pipeline retries. If the
+            # underlying failure is persistent, the next tick will
+            # see the same incomplete state and null again; audit TODO
+            # (future PR) will flag tiles stuck in this loop.
+            action = "null_retry"
+            leave_reason = None
 
         minoc_tag = "" if minoc_ok is None else f" minoc_ok={minoc_ok}"
         orphan_tag = "  [ORPHAN-PARTIAL]" if orphan_partial_flag else ""
-        print(f"[reconcile_ingest] tile {tile} ({current_status}): "
+        date_tag = (
+            f"  date={tile_date}"
+            if action in ("flip_ingested", "backfill_date") else ""
+        )
+        reason_tag = f"  reason={leave_reason}" if leave_reason else ""
+        has_date_tag = f"  db_has_date={db_has_date}" if action == "flip_ingested" else ""
+        print(f"[reconcile_ingest] tile {tile}: current={current_status}  "
               f"p3d={n_at_cadc}/{n_expected}{minoc_tag}  "
               f"session_alive={session_alive}  action={action}"
-              f"{orphan_tag}  {'(DRY-RUN)' if dry_run else ''}")
+              f"{date_tag}{has_date_tag}{reason_tag}{orphan_tag}  "
+              f"{'(DRY-RUN)' if dry_run else ''}")
 
         if dry_run:
             if action == "flip_ingested":
-                if current_status == "IngestFailed":
-                    flipped_from_failed += 1
+                if current_status == "IngestRunning":
+                    flipped_running += 1
                 else:
-                    flipped += 1
+                    flipped_failed += 1
+            elif action == "backfill_date":
+                date_backfilled += 1
             elif action == "null_retry":
                 nulled += 1
                 if orphan_partial_flag:
@@ -555,11 +703,35 @@ def reconcile_stuck_ingest_running(
 
         try:
             if action == "flip_ingested":
-                _patch_status(conn, band_number, tile, "Ingested")
-                if current_status == "IngestFailed":
-                    flipped_from_failed += 1
+                # Only touch what needs touching. If the DB already has
+                # a date, skip the date PATCH and just flip the status.
+                # If the date is missing, write date FIRST, status LAST,
+                # so any failure before the status flip leaves the row
+                # at IngestRunning/IngestFailed and the reconciler re-
+                # picks it on the next tick.
+                # tile_date fallback: TAP has 14/14 and minoc OK but no
+                # parseable lastModified (extremely rare — ISO-8601
+                # parse should always succeed on CAOM2). Use today's
+                # date so the DB has a concrete value and the row
+                # exits the stuck list rather than looping.
+                if db_has_date:
+                    _patch_status(conn, band_number, tile, "Ingested")
                 else:
-                    flipped += 1
+                    write_date = tile_date or datetime.now(tz=timezone.utc).date().isoformat()
+                    _write_consistent_ingested(
+                        conn, band_number, tile, write_date
+                    )
+                if current_status == "IngestRunning":
+                    flipped_running += 1
+                else:
+                    flipped_failed += 1
+            elif action == "backfill_date":
+                # Status is already 'Ingested'; only the date is missing
+                # (by definition of IngestedNoDate — db_has_date is False
+                # here). Write just the date; do not re-flip status.
+                write_date = tile_date or datetime.now(tz=timezone.utc).date().isoformat()
+                _patch_date(conn, band_number, tile, write_date)
+                date_backfilled += 1
             elif action == "null_retry":
                 _patch_status(conn, band_number, tile, None)
                 nulled += 1
@@ -567,12 +739,13 @@ def reconcile_stuck_ingest_running(
                     orphan_partial += 1
             else:
                 left_alone += 1
-        except Exception as e:  # noqa: BLE001 - want to keep going on a per-tile failure
+        except Exception as e:  # noqa: BLE001 - keep going on a per-tile failure
             print(f"[reconcile_ingest] tile {tile}: PATCH failed: {e!r}")
 
     summary = {
-        "flipped_ingested": flipped,
-        "flipped_from_failed": flipped_from_failed,
+        "flipped_from_running": flipped_running,
+        "flipped_from_failed": flipped_failed,
+        "date_backfilled": date_backfilled,
         "nulled": nulled,
         "left_alone": left_alone,
         "orphan_partial_nulled": orphan_partial,
