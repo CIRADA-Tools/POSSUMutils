@@ -90,13 +90,28 @@ with an inline curl delete command, and surfaced in a Prefect Markdown
 artifact `stale-skaha-sessions`. The reporter cleans up SKAHA side (the
 curl); the reconciler cleans up DB side independently.
 
+Each tick also emits a per-band Prefect Markdown artifact
+`reconcile-audit-band<N>` with a row per stuck tile (current DB state,
+action, CADC plane count, minoc, session_alive) so operators can audit every
+automatic action from the flow-run page. Tiles that have been null_retry-ed
+for at least `_LOOP_WARN_THRESHOLD` consecutive ticks (default 5, override
+via POSSUM_RECONCILER_LOOP_WARN_N) are flagged `LOOPING` in the artifact
+and a WARNING is logged. Loop counts are persisted to a small JSON file at
+_LOOP_STATE_PATH (default under /arc/projects/CIRADA/polarimetry/ASKAP/,
+overridable with POSSUM_RECONCILER_STATE_PATH); counters reset when the tile
+resolves (flip_ingested / backfill_date) or leaves the stuck list. This is
+the mechanism that catches persistent-failure cases (e.g. the sc2repo
+underflow on tile 11719) instead of letting them recycle silently.
+
 Call reconcile_stuck_ingest_running(band_number, conn) at the start of
 check_ingest_3Dpipeline.ingest_3Dpipeline() BEFORE get_tiles_for_ingest.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
+import tempfile
 from datetime import datetime, timezone
 
 import astroquery.cadc as cadc
@@ -160,6 +175,189 @@ _SKAHA_SESSION_URL = "https://ws-uv.canfar.net/skaha/v1/session"
 # only works when running headless on CANFAR as that user, which the
 # reconciler does NOT.
 _DEFAULT_CERT = os.path.expanduser("~/.ssl/cadcproxy.pem")
+
+# --- Loop-detection state ---------------------------------------------------
+#
+# A tile whose underlying ingest keeps failing (e.g. sc2repo deterministic
+# underflow on 11719) will cycle between NULL and IngestFailed every tick:
+# the reconciler nulls it, the launcher relaunches, do_ingest fails, back to
+# IngestFailed, reconciler nulls again, etc. The removal of wildcard
+# leave_alone branches (PR #25) traded quiet stuck rows for this loop. The
+# companion piece is counting consecutive null_retry actions on the same
+# tile across ticks and raising a WARNING once the count passes a threshold.
+#
+# State is a small JSON file, worker-shared via /arc/projects. Overridable
+# with POSSUM_RECONCILER_STATE_PATH for dev / tests. If the file is unreachable
+# we fall back to an empty in-memory state and log it — never fatal.
+_LOOP_STATE_PATH = os.environ.get(
+    "POSSUM_RECONCILER_STATE_PATH",
+    "/arc/projects/CIRADA/polarimetry/ASKAP/reconciler_state/reconcile_loop_counts.json",
+)
+# Number of consecutive null_retry ticks on the same tile before a WARNING.
+# 5 ticks * ~5 min/tick = ~25 min of persistent failure, which is well past
+# the usual transient-failure window a single retry fixes.
+_LOOP_WARN_THRESHOLD = int(os.environ.get("POSSUM_RECONCILER_LOOP_WARN_N", "5"))
+
+
+def _load_loop_state():
+    """Return dict {band_str: {tile_str: {consecutive_nulls, last_action,
+    last_tick_utc}}}. On any failure, return an empty dict + log."""
+    try:
+        with open(_LOOP_STATE_PATH) as fh:
+            return json.load(fh)
+    except FileNotFoundError:
+        return {}
+    except Exception as e:  # noqa: BLE001 - never let state I/O crash the tick
+        print(f"[reconcile_ingest] loop-state load failed ({_LOOP_STATE_PATH}): "
+              f"{e!r}; starting from empty state this tick")
+        return {}
+
+
+def _save_loop_state(state):
+    """Atomic write of the loop-state JSON. Soft-fails on I/O error."""
+    try:
+        d = os.path.dirname(_LOOP_STATE_PATH)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(
+            prefix=".reconcile_loop_counts_", suffix=".json", dir=d or None,
+        )
+        try:
+            with os.fdopen(fd, "w") as fh:
+                json.dump(state, fh, indent=2, sort_keys=True)
+            os.replace(tmp, _LOOP_STATE_PATH)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    except Exception as e:  # noqa: BLE001
+        print(f"[reconcile_ingest] loop-state save failed ({_LOOP_STATE_PATH}): "
+              f"{e!r}; loop detection will reset next tick")
+
+
+def _update_loop_state(state, band_number, action_log):
+    """Mutate `state` from the tick's actions and return the set of tile ids
+    currently exceeding the warn threshold.
+
+      - null_retry on a tile whose previous action was also null_retry
+        increments the consecutive counter.
+      - flip_ingested / backfill_date on a tile resets it (tile resolved).
+      - leave_alone / session_alive does not touch the counter (still owned
+        by the in-flight process; its next real action will set the counter).
+      - Tiles absent from this tick's stuck list are removed (they left the
+        stuck set, which means they're Ingested with a date, or ready for
+        a fresh launch — not in a loop).
+    """
+    band_key = f"band{band_number}"
+    band_state = state.setdefault(band_key, {})
+    now = datetime.now(tz=timezone.utc).isoformat(timespec="seconds")
+    seen_tiles = set()
+    looping = set()
+
+    for entry in action_log:
+        tile = str(entry["tile"])
+        action = entry["action"]
+        seen_tiles.add(tile)
+        prev = band_state.get(tile, {})
+        if action == "null_retry":
+            prev_action = prev.get("last_action")
+            consecutive = prev.get("consecutive_nulls", 0) + 1 \
+                if prev_action == "null_retry" else 1
+            band_state[tile] = {
+                "consecutive_nulls": consecutive,
+                "last_action": action,
+                "last_tick_utc": now,
+            }
+            if consecutive >= _LOOP_WARN_THRESHOLD:
+                looping.add(int(tile))
+        elif action in ("flip_ingested", "backfill_date"):
+            # resolved — clear
+            band_state.pop(tile, None)
+        else:
+            # leave_alone / unknown — keep previous counter, just refresh ts
+            if prev:
+                prev["last_action"] = action
+                prev["last_tick_utc"] = now
+                band_state[tile] = prev
+
+    # Tiles no longer in the stuck list have exited reconciler attention.
+    for tile in list(band_state.keys()):
+        if tile not in seen_tiles:
+            band_state.pop(tile, None)
+
+    return looping
+
+
+def _report_reconcile_audit(band_number, action_log, summary, looping_tiles):
+    """Emit the Prefect Markdown artifact for this tick.
+
+    One artifact per band, key = `reconcile-audit-band<N>`. Each tick replaces
+    the previous version; Prefect keeps the history, so operators can scroll
+    back to any tick from the flow-run page.
+    """
+    try:
+        from prefect.artifacts import create_markdown_artifact
+    except Exception:  # noqa: BLE001 - not under Prefect; print-only is fine
+        return None
+
+    lines = [
+        f"## Reconcile audit — band {band_number}",
+        "",
+        f"Summary: {summary}",
+    ]
+    if looping_tiles:
+        lines += [
+            "",
+            f"### :warning: WARNING: {len(looping_tiles)} tile(s) have been "
+            f"null-retrying for >= {_LOOP_WARN_THRESHOLD} consecutive ticks",
+            "",
+            "These are candidates for a persistent-failure investigation "
+            "(e.g. sc2repo metadata error on tile 11719). The reconciler "
+            "keeps nulling them because CADC remains incomplete.",
+            "",
+            "| Tile |",
+            "|---|",
+        ]
+        for t in sorted(looping_tiles):
+            lines.append(f"| `{t}` |")
+        lines.append("")
+    if action_log:
+        lines += [
+            "### Per-tile actions this tick",
+            "",
+            "| Tile | Current DB | Action | CADC planes | minoc | session_alive | Note |",
+            "|---|---|---|---|---|---|---|",
+        ]
+        for e in action_log:
+            tap_cell = f"{e['n_at_cadc']}/{e['n_expected']}"
+            minoc_cell = "-" if e["minoc_ok"] is None else ("ok" if e["minoc_ok"] else "404")
+            note_bits = []
+            if e.get("leave_reason"):
+                note_bits.append(f"reason={e['leave_reason']}")
+            if e.get("date"):
+                note_bits.append(f"date={e['date']}")
+            if e.get("orphan_partial"):
+                note_bits.append("orphan-partial")
+            if e["tile"] in looping_tiles:
+                note_bits.append("**LOOPING**")
+            note = " / ".join(note_bits)
+            lines.append(
+                f"| `{e['tile']}` | {e['current_status']} | **{e['action']}** | "
+                f"{tap_cell} | {minoc_cell} | {e['session_alive']} | {note} |"
+            )
+        lines.append("")
+    md = "\n".join(lines)
+
+    key = f"reconcile-audit-band{band_number}"
+    try:
+        create_markdown_artifact(key=key, markdown=md)
+        return key
+    except Exception as e:  # noqa: BLE001 - artifact create outside flow run
+        print(f"[reconcile_ingest] audit artifact create failed (not under "
+              f"a flow run?): {e!r}")
+        return None
 
 
 def _get_stuck_tiles_by_status(conn, band_number):
@@ -609,6 +807,7 @@ def reconcile_stuck_ingest_running(
 
     flipped_running = flipped_failed = date_backfilled = 0
     nulled = left_alone = orphan_partial = 0
+    action_log = []  # per-tile rows for the Prefect Markdown audit artifact
     for tile, (current_status, db_has_date) in stuck_by_status.items():
         planes_by_product = cadc_by_tile.get(tile, {})
         planes_present = set(planes_by_product.keys()) & expected
@@ -685,6 +884,20 @@ def reconcile_stuck_ingest_running(
               f"{date_tag}{has_date_tag}{reason_tag}{orphan_tag}  "
               f"{'(DRY-RUN)' if dry_run else ''}")
 
+        action_log.append({
+            "tile": tile,
+            "current_status": current_status,
+            "action": action,
+            "leave_reason": leave_reason,
+            "n_at_cadc": n_at_cadc,
+            "n_expected": n_expected,
+            "minoc_ok": minoc_ok,
+            "session_alive": session_alive,
+            "date": tile_date if action in ("flip_ingested", "backfill_date") else None,
+            "db_has_date": db_has_date,
+            "orphan_partial": orphan_partial_flag,
+        })
+
         if dry_run:
             if action == "flip_ingested":
                 if current_status == "IngestRunning":
@@ -752,5 +965,30 @@ def reconcile_stuck_ingest_running(
         "stale_skaha_detected": len(stale_sessions),
         "stuck_total": len(stuck_by_status),
     }
+
+    # Loop detection — update persistent counts and identify tiles that have
+    # been null_retry-ing for too long. In dry_run mode we do not mutate the
+    # saved state (would conflate planned actions with real history), but we
+    # still compute the current tick's "would-be loopers" against the loaded
+    # state so operators can see them in the audit artifact.
+    try:
+        loop_state = _load_loop_state()
+        looping = _update_loop_state(loop_state, band_number, action_log)
+        if not dry_run:
+            _save_loop_state(loop_state)
+    except Exception as e:  # noqa: BLE001 - never fail the tick on loop book-keeping
+        print(f"[reconcile_ingest] loop-detection step raised: {e!r}; "
+              "continuing without loop state")
+        looping = set()
+    summary["looping"] = len(looping)
+    if looping:
+        print(f"[reconcile_ingest] WARNING {len(looping)} tile(s) have been "
+              f"null-retrying for >= {_LOOP_WARN_THRESHOLD} consecutive ticks: "
+              + ", ".join(str(t) for t in sorted(looping)))
+
     print(f"[reconcile_ingest] band {band_number}: summary {summary}")
+
+    # Prefect artifact — per-tile table + loop warnings for operator review.
+    _report_reconcile_audit(band_number, action_log, summary, looping)
+
     return summary
