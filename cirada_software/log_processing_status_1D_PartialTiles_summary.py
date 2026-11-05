@@ -37,13 +37,33 @@ def arg_as_list(s):
 
 
 def check_pipeline_complete(log_file_path):
-    with open(log_file_path, "r") as file:
-        log_contents = file.read()
+    """Return "Completed" if the summary pipeline's log ends with the marker
+    "Pipeline complete.", else "Failed".
 
-    if "Pipeline complete." in log_contents:
-        return "Completed"
-    else:
-        return "Failed"
+    Robust against CANFAR /arc FUSE staleness: the summary flow runs in one
+    skaha session and this wrapper runs on a different Prefect worker.
+    Reading the log file immediately after the summary's close() can return a
+    truncated view that doesn't yet contain the final lines (observed
+    2026-11-05 on EMU_0812-77 SB 80563 — subsequent grep confirmed the file
+    DID contain "Pipeline complete." but this check returned Failed). We
+    retry a few times with a short delay before concluding Failed.
+    """
+    import time
+    MAX_TRIES = 6           # 0 + 5 retries
+    SLEEP_SECONDS = 5       # ~30 s total extra wait in the worst case
+
+    for attempt in range(MAX_TRIES):
+        try:
+            with open(log_file_path, "r") as file:
+                log_contents = file.read()
+        except OSError:
+            log_contents = ""
+        if "Pipeline complete." in log_contents:
+            return "Completed"
+        # not found yet — may be /arc staleness. Give it a moment and re-check.
+        if attempt < MAX_TRIES - 1:
+            time.sleep(SLEEP_SECONDS)
+    return "Failed"
 
 
 def update_1d_database(field_ID, SBid, band, status, conn):
