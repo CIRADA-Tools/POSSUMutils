@@ -94,31 +94,37 @@ def launch_ingestscript(tile_workdir):
 
 @task
 def check_report(tile_workdir):
-    """Check the report file for the number of inputs and successes"""
+    """Check the report file for the number of inputs and successes.
+
+    Returns:
+        (success, details) where details is a dict with keys:
+            inputs, successes, report_file, report_exists
+    """
     report_file = f"{tile_workdir}_report.txt"
+    details = {"inputs": None, "successes": None,
+               "report_file": report_file, "report_exists": False}
 
     if not os.path.exists(report_file):
         print(f"Report file {report_file} does not exist.")
-        return False
+        return False, details
 
-    inputs, successes = None, None
-
+    details["report_exists"] = True
     with open(report_file, "r") as file:
         for line in file:
             if "Number of Inputs" in line:
-                inputs = int(line.split(":")[1].strip())
+                details["inputs"] = int(line.split(":")[1].strip())
             if "Number of Successes" in line:
-                successes = int(line.split(":")[1].strip())
+                details["successes"] = int(line.split(":")[1].strip())
 
     # Expect 24 files for the 3D pipeline data.
-    if inputs == 24 and successes == 24:
+    if details["inputs"] == 24 and details["successes"] == 24:
         print("Ingest was successful.")
-        return True
+        return True, details
     else:
         print("Something has gone wrong with the ingest according to _report.txt")
-        print(f"Expected 24 inputs and found {inputs}")
-        print(f"Expected 24 successes and found {successes}")
-        return False
+        print(f"Expected 24 inputs and found {details['inputs']}")
+        print(f"Expected 24 successes and found {details['successes']}")
+        return False, details
 
 
 @task(cache_policy=NO_CACHE)
@@ -215,19 +221,30 @@ def check_CADC(
     print("Found products:")
     print(result_tile_band["productID"])
 
+    present_products = sorted({str(p) for p in result_tile_band["productID"]})
+    missing_products = [p for p in all_3dproducts if p not in present_products]
+    details = {
+        "present": present_products,
+        "missing": missing_products,
+        "n_present_p3d": sum(1 for p in present_products if p in all_3dproducts),
+        "n_expected_p3d": len(all_3dproducts),
+        "last_modified": None,
+    }
+
     # For 3D pipeline, there should be 17 products (and 3 inputs)
-    for product in all_3dproducts:
-        if product not in result_tile_band["productID"]:
+    if missing_products:
+        for product in missing_products:
             print(f"CADC is missing product {product}")
-            return False, None
+        return False, None, details
 
     print("CADC contains all products.")
 
     dt = [datetime.datetime.fromisoformat(x) for x in result_tile_band["lastModified"]]
     last_modified = max(dt)
+    details["last_modified"] = last_modified.isoformat()
     date = last_modified.date().isoformat()
 
-    return True, date
+    return True, date, details
 
 
 @task
@@ -290,6 +307,89 @@ def update_status_spreadsheet(tile_number, band, Google_API_token, date):
         print(f"Tile {tile_number} not found in the sheet.")
 
 
+def _build_failure_message(tile, band, report_details, cadc_details, verdict_note):
+    """Compose the ValueError message for a failed 3D ingest run.
+
+    Single-line summary suitable for the Prefect 'Failed' row — names the tile,
+    band, report counts, CADC product fraction, and the first few missing
+    product ids. The full list goes in the Markdown artifact.
+    """
+    r_inputs = report_details.get("inputs")
+    r_succ = report_details.get("successes")
+    n_present = cadc_details.get("n_present_p3d", 0)
+    n_expected = cadc_details.get("n_expected_p3d", len(all_3dproducts))
+    missing = cadc_details.get("missing", [])
+    short_missing = ",".join(missing[:3]) + (f",...+{len(missing)-3}" if len(missing) > 3 else "")
+    return (
+        f"Tile {tile} ({band}) IngestFailed: "
+        f"CADC has {n_present}/{n_expected} p3d planes"
+        + (f", missing [{short_missing}]" if missing else "")
+        + f"; _report.txt {r_succ}/{r_inputs} successes"
+        + (f". {verdict_note}" if verdict_note else "")
+    )
+
+
+def _emit_ingest_summary_artifact(tile, band, status, report_details,
+                                   cadc_details, verdict_note):
+    """Attach a per-run Markdown artifact to the Prefect flow run.
+
+    Safe to call on success or failure. Mirrors the per-tick audit pattern
+    used in reconcile_ingest.py. Never raises — if Prefect isn't available
+    (unit-test context) or the import fails, we log and move on.
+    """
+    try:
+        from prefect.artifacts import create_markdown_artifact
+    except ImportError:  # unit-test / offline context
+        print("create_markdown_artifact unavailable; skipping summary artifact.")
+        return
+
+    present = cadc_details.get("present", [])
+    missing = cadc_details.get("missing", [])
+    n_present = cadc_details.get("n_present_p3d", 0)
+    n_expected = cadc_details.get("n_expected_p3d", len(all_3dproducts))
+    r_inputs = report_details.get("inputs")
+    r_succ = report_details.get("successes")
+    last_mod = cadc_details.get("last_modified") or "—"
+
+    md_lines = [
+        f"# 3D ingest summary — tile {tile} ({band})",
+        "",
+        f"**Final status:** `{status}`",
+        "",
+        f"- `_report.txt` successes: **{r_succ}/{r_inputs}** "
+        f"(exists: {report_details.get('report_exists')})",
+        f"- CADC p3d planes present: **{n_present}/{n_expected}**",
+        f"- CADC last_modified: `{last_mod}`",
+    ]
+    if verdict_note:
+        md_lines += ["", f"_Note:_ {verdict_note}"]
+
+    if missing:
+        md_lines += [
+            "",
+            "## Missing p3d planes",
+            "",
+            *[f"- `{p}`" for p in missing],
+        ]
+    if present:
+        md_lines += [
+            "",
+            "## Present products at CADC",
+            "",
+            *[f"- `{p}`" for p in present],
+        ]
+
+    try:
+        create_markdown_artifact(
+            key=f"ingest-3d-{band.lower()}-tile{tile}",
+            markdown="\n".join(md_lines),
+            description=f"3D ingest summary for tile {tile} ({band}) — {status}",
+        )
+    except Exception as exc:  # noqa: BLE001
+        # Never let artifact writing block the flow outcome.
+        print(f"Could not attach 3D-ingest summary artifact: {exc!r}")
+
+
 @flow(log_prints=True, name="3D pipeline ingest")
 def do_ingest(
     tilenumber,
@@ -324,7 +424,7 @@ def do_ingest(
         print("Ingest script completed with errors")
 
     # Check the ingest report file
-    success = check_report(tile_workdir)
+    success, report_details = check_report(tile_workdir)
 
     # Wait 33 minutes, I think CADC takes a bit of time to update
     if not test:
@@ -332,7 +432,7 @@ def do_ingest(
 
     # Check the CADC also if indeed all files are there
     # if this fails with SSLError, try to run cadc-get-cert -u <username> on CANFAR
-    CADCsuccess, date = check_CADC(tilenumber, band, CADC_cert_file)
+    CADCsuccess, date, cadc_details = check_CADC(tilenumber, band, CADC_cert_file)
 
     # CADC is the source of truth for ingest success: if all expected products are
     # in CADC, the tile is ingested regardless of what `_report.txt` says about this
@@ -340,17 +440,28 @@ def do_ingest(
     # so transient minoc timeouts on files that were already uploaded by a prior partial
     # run produce false-negative IngestFailed status (seen on tiles 11720, 11532, 11846).
     status = "IngestFailed"
+    verdict_note = ""
     if CADCsuccess:
         status = "Ingested"
         if not success:
-            print(
-                "_report.txt reports per-file errors but CADC contains all expected "
-                "products; treating as Ingested."
+            verdict_note = (
+                "_report.txt reports per-file errors but CADC contains all "
+                "expected products; treating as Ingested."
             )
+            print(verdict_note)
     elif success:
-        print("_report.txt reports successful ingest but CADC is missing products.")
+        verdict_note = "_report.txt reports successful ingest but CADC is missing products."
+        print(verdict_note)
     else:
-        print("_report.txt reports that ingestion failed and CADC is missing products.")
+        verdict_note = "_report.txt reports that ingestion failed and CADC is missing products."
+        print(verdict_note)
+
+    # Attach a per-run Markdown artifact so the Prefect UI shows what actually
+    # happened, not just "Ingestion failed somehow." Modeled on the reconciler
+    # audit artifact pattern (reconcile_ingest.py).
+    _emit_ingest_summary_artifact(
+        tilenumber, band, status, report_details, cadc_details, verdict_note
+    )
 
     # Record the status in the POSSUM Validation database
     conn = rest_api.PossumApiClient()
@@ -364,8 +475,11 @@ def do_ingest(
         update_status_spreadsheet(tilenumber, band, Google_API_token, date)
 
     else:
-        # Make sure to raise an error such that the flow run is marked as failed
-        raise ValueError("Ingestion failed somehow.")
+        # Rich error message so Prefect's "Failed" row names the actual problem
+        # instead of the old "Ingestion failed somehow." catch-all.
+        raise ValueError(_build_failure_message(
+            tilenumber, band, report_details, cadc_details, verdict_note
+        ))
 
 
 if __name__ == "__main__":
